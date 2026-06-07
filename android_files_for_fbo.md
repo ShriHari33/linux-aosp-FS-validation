@@ -1,16 +1,7 @@
 ---
 title: "Android Application Files — A Reference for FBO 3.0"
 subtitle: "What lives where, in what format, and how to enumerate it"
-date: "2026-06-03"
-geometry: margin=1in
-fontsize: 11pt
-documentclass: article
-header-includes:
-  - \usepackage{fvextra}
-  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
-  - \usepackage{xcolor}
-  - \definecolor{codebg}{rgb}{0.96,0.96,0.96}
-  - \usepackage{tcolorbox}
+date: "2026-06-07"
 ---
 
 # 1. The mental model
@@ -57,7 +48,7 @@ structure is otherwise completely regular.
         ├── split_config.<density>.apk          # zero or more
         ├── split_config.<locale>.apk           # zero or more
         ├── lib/                                # may or may not exist
-        │   └── <abi>/
+        │   └── <isa>/                          # arm64, arm, x86_64, x86
         │       ├── libfoo.so
         │       └── libbar.so
         └── oat/
@@ -194,10 +185,20 @@ benefit per pinned byte, `.art` is the candidate. It's small, it's the
 first thing read, and its access pattern is read-once-sequential which
 is the worst case for unpinned flash on a phone that just woke up.
 
-### `lib/<abi>/*.so`
+### `lib/<isa>/*.so`
 
 Native libraries, extracted to disk at install time, **if** the app
 manifest has `android:extractNativeLibs="true"`.
+
+A naming quirk to be aware of: inside the APK the libs live under
+`lib/<abi>/` using the full Android ABI name (`arm64-v8a`,
+`armeabi-v7a`, `x86_64`, `x86`). When extracted to disk under
+`/data/app/.../lib/`, the directory is renamed to the **short ISA**
+form (`arm64`, `arm`, `x86_64`, `x86`) — the same naming used for
+`oat/<isa>/`. The mapping is `arm64-v8a -> arm64`,
+`armeabi-v7a -> arm`, others unchanged. So a file that ships at
+`lib/arm64-v8a/libfoo.so` inside `base.apk` ends up as
+`<install-dir>/lib/arm64/libfoo.so` on disk after extraction.
 
 Since Android 6, the default has been to *not* extract — instead the
 `.so` files live inside `base.apk` (or inside a `split_config` APK),
@@ -207,7 +208,7 @@ data on disk) and is the modern default.
 
 For the FBO 3.0 enumeration, you handle both cases:
 
-- If `lib/<abi>/` exists under the install dir: pin those `.so` files
+- If `lib/<isa>/` exists under the install dir: pin those `.so` files
   as separate entries.
 - If it does not exist: the libs are inside `base.apk` (or splits), so
   pinning the APK covers them.
@@ -401,7 +402,7 @@ DIR=$(dirname "$(echo "$APKS" | head -1)")
 
 echo "$APKS"
 ls "$DIR/oat/$ISA"/* 2>/dev/null     # base.odex, base.vdex, base.art
-ls "$DIR/lib/$ABI"/* 2>/dev/null     # only if extracted
+ls "$DIR/lib/$ISA"/* 2>/dev/null     # only if extracted (uses ISA, not ABI)
 ```
 
 This is the complete static pinnable surface for one package. For
@@ -562,7 +563,8 @@ The Android application file layout, for the purposes of FBO 3.0, is:
 - **Distribution files** live under `/data/app/<H1>/<package>-<H2>/`
   with predictable structure but randomized hashes.
 - The hot set is `base.apk`, `split_config.*.apk`, `oat/<isa>/*`, and
-  optionally `lib/<abi>/*.so` if extracted.
+  optionally `lib/<isa>/*.so` if extracted (note: on-disk uses the
+  short ISA form, e.g. `arm64`, not the APK-internal `arm64-v8a`).
 - The set is enumerable via `pm path` and one directory listing.
 - The set is stable between launches; invalidated only by app update,
   uninstall, or OAT regeneration.
@@ -580,27 +582,40 @@ interface, which is OEM-specific and outside the scope of this
 document.
 
 ---
-
 # 11. Reference implementation
 
-This section contains a complete working reference for the static-pin
-flow described in this document. It is written so it compiles and runs
-on an x86 Linux box (where the UFS pin step is stubbed and F2FS pin is
-silently no-op'd on ext4) and ports to Android with no source changes
-once the `ufs_vendor_pin()` function is wired to the real OEM pin
-interface.
+This section contains the complete set of working programs and scripts
+for FBO 3.0. There is one C program with five subcommands, plus two
+optional shell helpers. Together they cover both the production
+pin/unpin path and the validation/analysis workflow.
 
-Two files:
+## 11.1 Tool inventory
 
-- **`fbo_pin.c`** — the per-file pin/unpin/list tool. Performs the
-  F2FS pin, FIEMAP, UFS pin (stub), and record-keeping for one or
-  more files passed on the command line.
-- **`fbo_enum.sh`** — Android-side shell wrapper that resolves a
-  package name to its distribution file set using `pm path` and a
-  directory listing, and prints one path per line. Pipe its output
-  into `fbo_pin pin`.
+| File | Type | Purpose |
+|---|---|---|
+| `fbo_pin.c` / `fbo_pin` | C program | The main tool. Five subcommands: `pin`, `app`, `observe`, `unpin`, `list`. |
+| `fbo_enum.sh` | Shell | Optional. Standalone enumeration (same logic as `fbo_pin app`'s first half). Useful when you only have a shell. |
+| `fbo_inspect.sh` | Shell | Analysis tool. Launches an app, reads `/proc/<pid>/maps`, reports byte breakdown across `/data/app/`, `/system/`, `/apex/`, `/data/data/`. |
 
-## 11.1 `fbo_pin.c`
+The C program is the deliverable. The shell scripts are diagnostic
+aids — useful while developing and validating, not required at runtime
+in production.
+
+## 11.2 The five subcommands of `fbo_pin`
+
+```
+fbo_pin pin     <record-file> <file>...               pin explicit files
+fbo_pin app     <record-file> <package>               static enum + pin
+fbo_pin observe <record-file> <package> [<activity>]  launch + maps + pin
+fbo_pin unpin   <record-file>                         reverse a previous pin
+fbo_pin list    <record-file>                         dump the record
+```
+
+The two discovery modes — `app` (static, via `pm path` + directory
+walk) and `observe` (runtime, via `/proc/<pid>/maps`) — feed into the
+same pin backend. The relationship is covered in detail in Section 13.
+
+## 11.3 `fbo_pin.c` (full source)
 
 ```c
 /*
@@ -608,10 +623,19 @@ Two files:
  *
  * Build: gcc -O2 -Wall -o fbo_pin fbo_pin.c
  *
- * Usage:
- *   sudo ./fbo_pin pin   <record-file> <file> [<file>...]
- *   sudo ./fbo_pin unpin <record-file>
- *        ./fbo_pin list  <record-file>
+ * Per-file pin sequence:
+ *   open(path, O_RDONLY)
+ *     -> ioctl(fd, F2FS_IOC_SET_PIN_FILE, &one)    [best-effort]
+ *     -> ioctl(fd, FS_IOC_FIEMAP, &fiemap)
+ *     -> ufs_vendor_pin(extents)                   [stubbed]
+ *     -> record (path, inode, mtime, extents)
+ *
+ * Commands:
+ *   pin     <record-file> <file>...
+ *   app     <record-file> <package>
+ *   observe <record-file> <package> [<activity>]
+ *   unpin   <record-file>
+ *   list    <record-file>
  */
 
 #define _GNU_SOURCE
@@ -621,22 +645,216 @@ Two files:
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <libgen.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/fiemap.h>
 
-/* F2FS pin ioctl. The number is part of the kernel ABI and stable.
- * Defined locally because <linux/f2fs.h> isn't always packaged. */
 #ifndef F2FS_IOC_SET_PIN_FILE
 #define F2FS_IOC_SET_PIN_FILE _IOW(0xf5, 13, __u32)
 #endif
 
 #define MAX_EXTENTS 1024
 
-/* Step 1: tell F2FS not to relocate this file's blocks during GC.
- * Silently ignored on non-F2FS filesystems (ENOTTY). */
+/* ----- Generic helpers ----- */
+
+static int popen_lines(const char *cmd, char ***out)
+{
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    char **arr = NULL;
+    int n = 0, cap = 0;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), p)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+            buf[--len] = 0;
+        if (len == 0) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            arr = realloc(arr, cap * sizeof(*arr));
+        }
+        arr[n++] = strdup(buf);
+    }
+    pclose(p);
+    *out = arr;
+    return n;
+}
+
+static void free_lines(char **arr, int n) {
+    if (!arr) return;
+    for (int i = 0; i < n; i++) free(arr[i]);
+    free(arr);
+}
+
+static void dir_append_files(const char *dir,
+                             char ***vec, int *n, int *cap)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[2048];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) continue;
+        if (*n == *cap) {
+            *cap = *cap ? *cap * 2 : 16;
+            *vec = realloc(*vec, *cap * sizeof(**vec));
+        }
+        (*vec)[(*n)++] = strdup(path);
+    }
+    closedir(d);
+}
+
+/* ----- Android-specific helpers ----- */
+
+static const char *abi_to_isa(const char *abi)
+{
+    if (strcmp(abi, "arm64-v8a") == 0)   return "arm64";
+    if (strcmp(abi, "armeabi-v7a") == 0) return "arm";
+    return abi;
+}
+
+static int read_device_abi(char *out, size_t outlen)
+{
+    char **lines = NULL;
+    int n = popen_lines("getprop ro.product.cpu.abi", &lines);
+    if (n < 1) { free_lines(lines, n); return -1; }
+    snprintf(out, outlen, "%s", lines[0]);
+    free_lines(lines, n);
+    return 0;
+}
+
+/* Enumerate the static distribution file set for an Android package:
+ *   base.apk + every split + oat/<isa>/* + lib/<isa>/* (if extracted)
+ */
+static int enumerate_package(const char *pkg, char ***out)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pm path %s 2>/dev/null", pkg);
+    char **lines = NULL;
+    int nl = popen_lines(cmd, &lines);
+    if (nl < 1) {
+        fprintf(stderr,
+            "enumerate: package not installed or pm unavailable: %s\n",
+            pkg);
+        free_lines(lines, nl);
+        return -1;
+    }
+    char **files = NULL;
+    int nf = 0, cap = 0;
+    for (int i = 0; i < nl; i++) {
+        const char *p = lines[i];
+        if (strncmp(p, "package:", 8) == 0) p += 8;
+        if (nf == cap) {
+            cap = cap ? cap * 2 : 16;
+            files = realloc(files, cap * sizeof(*files));
+        }
+        files[nf++] = strdup(p);
+    }
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", files[0]);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    free_lines(lines, nl);
+
+    char abi[64];
+    if (read_device_abi(abi, sizeof(abi)) == 0) {
+        const char *isa = abi_to_isa(abi);
+        char sub[2048];
+        snprintf(sub, sizeof(sub), "%s/oat/%s", dir, isa);
+        dir_append_files(sub, &files, &nf, &cap);
+        snprintf(sub, sizeof(sub), "%s/lib/%s", dir, isa);
+        dir_append_files(sub, &files, &nf, &cap);
+    } else {
+        fprintf(stderr,
+            "enumerate: ro.product.cpu.abi unavailable; "
+            "skipping oat/ and lib/\n");
+    }
+    *out = files;
+    return nf;
+}
+
+/* Read /proc/<pid>/maps and return a deduplicated list of mapped
+ * file paths matching the given prefix. */
+static int read_proc_maps(int pid, const char *prefix, char ***out)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    char **vec = NULL;
+    int n = 0, cap = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = 0;
+        char *p = strrchr(line, ' ');
+        if (!p) continue;
+        p++;
+        if (*p != '/') continue;
+        if (strncmp(p, "/dev/", 5) == 0) continue;
+        if (strncmp(p, "/memfd:", 7) == 0) continue;
+        if (strncmp(p, prefix, strlen(prefix)) != 0) continue;
+        int dup = 0;
+        for (int i = 0; i < n; i++)
+            if (strcmp(vec[i], p) == 0) { dup = 1; break; }
+        if (dup) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            vec = realloc(vec, cap * sizeof(*vec));
+        }
+        vec[n++] = strdup(p);
+    }
+    fclose(f);
+    *out = vec;
+    return n;
+}
+
+static int resolve_activity(const char *pkg, char *out, size_t outlen)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "cmd package resolve-activity --brief %s 2>/dev/null", pkg);
+    char **lines = NULL;
+    int n = popen_lines(cmd, &lines);
+    if (n < 1) { free_lines(lines, n); return -1; }
+    const char *comp = lines[n - 1];
+    if (!strchr(comp, '/')) { free_lines(lines, n); return -1; }
+    snprintf(out, outlen, "%s", comp);
+    free_lines(lines, n);
+    return 0;
+}
+
+static int wait_for_pid(const char *pkg, int secs)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "pidof %s 2>/dev/null", pkg);
+    for (int i = 0; i < secs; i++) {
+        char **lines = NULL;
+        int n = popen_lines(cmd, &lines);
+        if (n >= 1) {
+            int pid = atoi(lines[0]);
+            free_lines(lines, n);
+            if (pid > 0) return pid;
+        }
+        free_lines(lines, n);
+        sleep(1);
+    }
+    return -1;
+}
+
+/* ----- Pin / FIEMAP / record ----- */
+
 static int do_f2fs_pin(int fd, const char *path, int pin)
 {
     __u32 v = pin ? 1 : 0;
@@ -649,7 +867,6 @@ static int do_f2fs_pin(int fd, const char *path, int pin)
     return 0;
 }
 
-/* Step 2: read the (logical -> physical LBA, length) extent map. */
 static int fiemap_file(int fd, const char *path,
                        struct fiemap_extent *out, unsigned *out_n)
 {
@@ -657,15 +874,12 @@ static int fiemap_file(int fd, const char *path,
                    MAX_EXTENTS * sizeof(struct fiemap_extent);
     struct fiemap *fm = calloc(1, bytes);
     if (!fm) { perror("calloc"); return -1; }
-
     fm->fm_start        = 0;
     fm->fm_length       = ~0ULL;
     fm->fm_flags        = FIEMAP_FLAG_SYNC;
     fm->fm_extent_count = MAX_EXTENTS;
-
     if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
-        fprintf(stderr, "  FIEMAP on %s: %s\n",
-                path, strerror(errno));
+        fprintf(stderr, "  FIEMAP on %s: %s\n", path, strerror(errno));
         free(fm);
         return -1;
     }
@@ -677,9 +891,6 @@ static int fiemap_file(int fd, const char *path,
     return 0;
 }
 
-/* Step 3: ship LBA ranges to the UFS pin command. Stubbed here —
- * on a real device, replace this with the OEM's pin interface
- * (sysfs write, scsi passthrough, or vendor ioctl). */
 static int ufs_vendor_pin(const char *path,
                           const struct fiemap_extent *exts, unsigned n,
                           int pin)
@@ -696,7 +907,6 @@ static int ufs_vendor_pin(const char *path,
     return 0;
 }
 
-/* Step 4: persist what we pinned so unpin can reverse it. */
 static int record_write(FILE *rec, const char *path,
                         ino_t ino, time_t mtime,
                         const struct fiemap_extent *exts, unsigned n)
@@ -713,35 +923,33 @@ static int record_write(FILE *rec, const char *path,
     return 0;
 }
 
-static int cmd_pin(const char *recpath, char **paths, int npaths)
+static int pin_files(const char *recpath, char **paths, int npaths)
 {
     FILE *rec = fopen(recpath, "w");
     if (!rec) { perror(recpath); return 1; }
-
     int ok = 0;
     for (int i = 0; i < npaths; i++) {
         const char *path = paths[i];
         printf("PIN %s\n", path);
-
         int fd = open(path, O_RDONLY);
         if (fd < 0) {
             fprintf(stderr, "  open: %s\n", strerror(errno));
             continue;
         }
         struct stat st;
-        if (fstat(fd, &st) < 0) { perror("  fstat"); close(fd); continue; }
-
+        if (fstat(fd, &st) < 0) {
+            perror("  fstat"); close(fd); continue;
+        }
         do_f2fs_pin(fd, path, 1);
-
         struct fiemap_extent exts[MAX_EXTENTS];
         unsigned n = 0;
-        if (fiemap_file(fd, path, exts, &n) < 0) { close(fd); continue; }
-
+        if (fiemap_file(fd, path, exts, &n) < 0) {
+            close(fd); continue;
+        }
         ufs_vendor_pin(path, exts, n, 1);
         record_write(rec, path, st.st_ino, st.st_mtime, exts, n);
-
         close(fd);
-        printf("  done — %u extent(s) pinned\n\n", n);
+        printf("  done -- %u extent(s) pinned\n\n", n);
         ok++;
     }
     fclose(rec);
@@ -749,14 +957,76 @@ static int cmd_pin(const char *recpath, char **paths, int npaths)
     return 0;
 }
 
+/* ----- Commands ----- */
+
+static int cmd_pin(const char *recpath, char **paths, int npaths)
+{
+    return pin_files(recpath, paths, npaths);
+}
+
+static int cmd_app(const char *recpath, const char *pkg)
+{
+    char **files = NULL;
+    int n = enumerate_package(pkg, &files);
+    if (n < 0) return 1;
+    printf("enumerated %d file(s) for %s:\n", n, pkg);
+    for (int i = 0; i < n; i++) printf("  %s\n", files[i]);
+    printf("\n");
+    int rc = pin_files(recpath, files, n);
+    for (int i = 0; i < n; i++) free(files[i]);
+    free(files);
+    return rc;
+}
+
+static int cmd_observe(const char *recpath, const char *pkg,
+                       const char *activity_opt)
+{
+    char activity[256];
+    if (activity_opt && strchr(activity_opt, '/')) {
+        snprintf(activity, sizeof(activity), "%s", activity_opt);
+    } else if (resolve_activity(pkg, activity, sizeof(activity)) < 0) {
+        fprintf(stderr,
+            "observe: could not resolve activity for %s; "
+            "pass it as 4th arg\n", pkg);
+        return 1;
+    }
+    char cmd[512];
+    int unused;
+    snprintf(cmd, sizeof(cmd), "am force-stop %s >/dev/null 2>&1", pkg);
+    unused = system(cmd);
+    sleep(1);
+    snprintf(cmd, sizeof(cmd), "am start -n %s >/dev/null 2>&1", activity);
+    unused = system(cmd);
+    (void)unused;
+    int pid = wait_for_pid(pkg, 10);
+    if (pid < 0) {
+        fprintf(stderr, "observe: process never appeared for %s\n", pkg);
+        return 1;
+    }
+    sleep(3);
+    char **files = NULL;
+    int n = read_proc_maps(pid, "/data/app/", &files);
+    if (n < 0) return 1;
+    if (n == 0) {
+        fprintf(stderr,
+            "observe: no /data/app/ files mapped\n");
+        return 1;
+    }
+    printf("observed %d mapped file(s) under /data/app/ for %s (pid %d):\n",
+           n, pkg, pid);
+    for (int i = 0; i < n; i++) printf("  %s\n", files[i]);
+    printf("\n");
+    int rc = pin_files(recpath, files, n);
+    for (int i = 0; i < n; i++) free(files[i]);
+    free(files);
+    return rc;
+}
+
 static int cmd_unpin(const char *recpath)
 {
     FILE *rec = fopen(recpath, "r");
     if (!rec) { perror(recpath); return 1; }
-
     char line[1024], path[512] = {0};
-
-    /* First pass: unpin every recorded extent. */
     while (fgets(line, sizeof(line), rec)) {
         if (strncmp(line, "FILE ", 5) == 0) {
             sscanf(line, "FILE %511s", path);
@@ -773,8 +1043,6 @@ static int cmd_unpin(const char *recpath)
             }
         }
     }
-
-    /* Second pass: clear the F2FS pin so the file is GC-eligible again. */
     rewind(rec);
     while (fgets(line, sizeof(line), rec)) {
         if (strncmp(line, "FILE ", 5) != 0) continue;
@@ -801,31 +1069,33 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr,
             "usage:\n"
-            "  %s pin   <record-file> <file>...\n"
-            "  %s unpin <record-file>\n"
-            "  %s list  <record-file>\n",
-            argv[0], argv[0], argv[0]);
+            "  %s pin     <record-file> <file>...\n"
+            "  %s app     <record-file> <package>\n"
+            "  %s observe <record-file> <package> [<activity>]\n"
+            "  %s unpin   <record-file>\n"
+            "  %s list    <record-file>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
     if (strcmp(argv[1], "pin") == 0 && argc >= 4)
         return cmd_pin(argv[2], &argv[3], argc - 3);
+    if (strcmp(argv[1], "app") == 0 && argc == 4)
+        return cmd_app(argv[2], argv[3]);
+    if (strcmp(argv[1], "observe") == 0 && (argc == 4 || argc == 5))
+        return cmd_observe(argv[2], argv[3], argc == 5 ? argv[4] : NULL);
     if (strcmp(argv[1], "unpin") == 0) return cmd_unpin(argv[2]);
     if (strcmp(argv[1], "list") == 0)  return cmd_list(argv[2]);
-    fprintf(stderr, "unknown command: %s\n", argv[1]);
+    fprintf(stderr, "unknown command or wrong arity: %s\n", argv[1]);
     return 1;
 }
 ```
 
-## 11.2 `fbo_enum.sh`
+## 11.4 `fbo_enum.sh` (shell-only enumeration)
 
 ```bash
 #!/system/bin/sh
-# fbo_enum.sh — enumerate the static distribution-side files of an
-# Android package. Output: one absolute path per line.
-#
-# Pipe into fbo_pin:
-#   fbo_enum.sh com.antutu.ABenchMark | \
-#     xargs ./fbo_pin pin /data/local/tmp/fbo_antutu.rec
+# fbo_enum.sh — enumerate the static distribution-side files of a
+# package. Output: one absolute path per line. Pipe to fbo_pin pin.
 
 PKG=$1
 [ -z "$PKG" ] && { echo "usage: $0 <package>" >&2; exit 1; }
@@ -846,112 +1116,555 @@ DIR=$(dirname "$(echo "$APKS" | head -n1)")
 
 echo "$APKS"
 ls "$DIR/oat/$ISA"/* 2>/dev/null
-ls "$DIR/lib/$ABI"/* 2>/dev/null
+ls "$DIR/lib/$ISA"/* 2>/dev/null
 ```
 
-## 11.3 Sample run on an x86 Linux box
+## 11.5 `fbo_inspect.sh` (runtime analysis)
 
-Build, prep a sparse test file (so FIEMAP returns multiple extents),
-and run the full pin / list / unpin cycle:
+This script launches an app, snapshots its memory map, and reports the
+byte breakdown across the directories that matter. It is the tool that
+generates the app-vs-framework byte ratio discussed in Section 12.
+
+```bash
+#!/system/bin/sh
+# fbo_inspect.sh — launch an Android app and summarize what files it
+# has mmap'd, broken down by where on disk they live.
+
+PKG=$1
+ACT=$2
+
+if [ -z "$PKG" ]; then
+    echo "usage: $0 <package> [<activity-component>]" >&2
+    exit 1
+fi
+
+file_size() {
+    s=$(stat -c '%s' "$1" 2>/dev/null)
+    if [ -z "$s" ]; then s=$(wc -c < "$1" 2>/dev/null); fi
+    echo "${s:-0}"
+}
+
+sum_sizes() {
+    total=0
+    while read -r f; do
+        [ -f "$f" ] || continue
+        s=$(file_size "$f")
+        total=$((total + s))
+    done
+    echo "$total"
+}
+
+mb() { awk -v b="$1" 'BEGIN { printf "%.1f MB", b/1048576 }'; }
+
+if [ -z "$ACT" ]; then
+    ACT=$(cmd package resolve-activity --brief "$PKG" 2>/dev/null \
+          | tail -1 | tr -d '\r')
+fi
+if [ -z "$ACT" ] || ! echo "$ACT" | grep -q '/'; then
+    echo "could not resolve activity for $PKG" >&2
+    exit 1
+fi
+
+am force-stop "$PKG"; sleep 1
+am start -n "$ACT" >/dev/null 2>&1
+
+PID=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    PID=$(pidof "$PKG" 2>/dev/null)
+    [ -n "$PID" ] && break
+    sleep 1
+done
+[ -z "$PID" ] && { echo "process never appeared" >&2; exit 1; }
+
+sleep 3
+
+MAPS=/data/local/tmp/fbo_inspect_$PID.maps
+cat /proc/$PID/maps | awk '{print $NF}' | sort -u \
+    | grep -v '^\[' | grep -v '^$' \
+    | grep -v '^/memfd' | grep -v '^/dev/' > "$MAPS"
+
+report_category() {
+    label=$1
+    pattern=$2
+    files=$(grep -E "$pattern" "$MAPS")
+    count=$(echo "$files" | grep -c .)
+    bytes=$(echo "$files" | sum_sizes)
+    echo "[$label]"
+    echo "  files : $count"
+    echo "  bytes : $bytes ($(mb $bytes))"
+}
+
+report_category "/data/app/ (per-app, FBO target)"  '^/data/app/'
+report_category "/system/ + /apex/ (framework)"     '^/system/|^/apex/'
+report_category "/data/data/ (runtime data)"        '^/data/data/'
+report_category "/data/dalvik-cache/ (boot OAT)"    '^/data/dalvik-cache/'
+
+echo
+echo "[/data/app/ files in detail]"
+grep '^/data/app/' "$MAPS" | while read -r f; do
+    [ -f "$f" ] || continue
+    s=$(file_size "$f")
+    printf "  %10d  %s\n" "$s" "$f"
+done | sort -rn
+
+rm -f "$MAPS"
+```
+
+## 11.6 Building and deploying
+
+On a Linux workstation (x86 testing or NDK cross-build):
 
 ```
-$ gcc -O2 -Wall -o fbo_pin fbo_pin.c
-$ dd if=/dev/urandom of=/tmp/fbo_sample bs=4K count=64
-$ dd if=/dev/urandom of=/tmp/fbo_sample bs=4K count=32 seek=128 conv=notrunc
+# Native x86 build (for testing the pin/list/unpin path)
+gcc -O2 -Wall -o fbo_pin fbo_pin.c
 
-$ ./fbo_pin pin /tmp/fbo_sample.rec /tmp/fbo_sample
-PIN /tmp/fbo_sample
-  ufs_PIN  lba=0x2db2800000  len=0x40000  flags=0x0
-  ufs_PIN  lba=0x2db2880000  len=0x20000  flags=0x1
-  done -- 2 extent(s) pinned
+# Android cross-build with the NDK
+$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang \
+    -O2 -Wall -o fbo_pin fbo_pin.c
 
-pinned 1 / 1 files; record at /tmp/fbo_sample.rec
-
-$ ./fbo_pin list /tmp/fbo_sample.rec
-FILE /tmp/fbo_sample ino=2886497 mtime=1780501629 nextents=2
-  EXT phys=0x2db2800000 len=0x40000 flags=0x0
-  EXT phys=0x2db2880000 len=0x20000 flags=0x1
-
-$ ./fbo_pin unpin /tmp/fbo_sample.rec
-UNPIN /tmp/fbo_sample
-  ufs_UNPIN  lba=0x2db2800000  len=0x40000  flags=0x0
-  ufs_UNPIN  lba=0x2db2880000  len=0x20000  flags=0x1
+# Push everything to a rooted dev device
+adb push fbo_pin fbo_enum.sh fbo_inspect.sh /data/local/tmp/
+adb shell chmod +x /data/local/tmp/fbo_pin /data/local/tmp/*.sh
 ```
 
-Two extents because the second `dd` left a hole between block 64 and
-block 128 — exactly the kind of layout you'll see for installed APKs
-after the filesystem has aged a bit.
-
-The F2FS pin step printed no warning because we're on ext4 and the
-ioctl returns `ENOTTY`, which the code intentionally swallows. On an
-F2FS mount the same code path would actually pin and you'd see the
-warning only if the kernel refused (e.g., the file was open for
-write, or the non-GC region was full).
-
-## 11.4 End-to-end workflow on Android
-
-The intended composition of the two tools on a rooted dev target:
+Then either via adb shell or directly on the device console, as root:
 
 ```
-adb push fbo_pin fbo_enum.sh /data/local/tmp/
-adb shell chmod +x /data/local/tmp/fbo_pin /data/local/tmp/fbo_enum.sh
-
-adb shell
-# now on device
 cd /data/local/tmp
 
-# Enumerate the file set for one package.
-./fbo_enum.sh com.antutu.ABenchMark
+# Production-style: static enum + pin
+./fbo_pin app  /data/local/tmp/antutu.rec  com.antutu.ABenchMark
 
-# Pin the whole set with one command.
-./fbo_enum.sh com.antutu.ABenchMark | \
-    xargs ./fbo_pin pin /data/local/tmp/fbo_antutu.rec
+# Validation-style: launch + observe + pin
+./fbo_pin observe  /data/local/tmp/antutu_obs.rec  com.antutu.ABenchMark
 
-# Verify what got recorded.
-./fbo_pin list /data/local/tmp/fbo_antutu.rec
+# Analysis: byte breakdown across categories
+./fbo_inspect.sh  com.antutu.ABenchMark
 
-# Launch Antutu through the normal launcher. Reads benefit from the
-# pin. Nothing of ours is in the data path while Antutu runs.
-
-# When done, unpin.
-./fbo_pin unpin /data/local/tmp/fbo_antutu.rec
+# Tear down
+./fbo_pin unpin  /data/local/tmp/antutu.rec
 ```
 
-The composition is deliberate: `fbo_enum.sh` is Android-specific,
-`fbo_pin` is filesystem-and-storage-specific. The seam between them
-is just absolute file paths on stdout, so the same `fbo_pin` binary
-serves any workflow that produces a list of files to pin.
+## 11.7 What to change for production
 
-## 11.5 What to change for production
+The reference implementation is intentionally minimal. To go from this
+to a daemon shipped to OEMs:
 
-The reference implementation is intentionally minimal. To move from
-this to a production daemon shipped to OEMs, the deltas are:
+1. **`ufs_vendor_pin()`** — replace the `printf` with the actual call
+   to the OEM's pin interface (vendor sysfs node, scsi passthrough, or
+   vendor ioctl). The function signature does not change.
+2. **Record store** — replace the text record file with SQLite or a
+   small binary format, keyed by package name.
+3. **Lifecycle integration** — replace the CLI driver with a service
+   subscribing to `ACTION_PACKAGE_REPLACED`, `ACTION_PACKAGE_REMOVED`,
+   and OAT-regeneration signals.
+4. **Pin budget management** — LRU eviction keyed on per-app launch
+   timestamps from `usagestats`.
+5. **SELinux policy** — vendor domain for the daemon.
+6. **init.rc service definition** — standard plumbing.
+7. **Telemetry** — per-app pin success/failure counts, region
+   utilization, time-since-last-pin per app.
 
-1. **`ufs_vendor_pin()`**: replace the `printf` with the actual call
-   to the OEM's pin interface. This is the single most important
-   substitution and is where most of the per-customer integration work
-   happens. The function signature does not change.
-2. **Record store**: replace the text record file with something
-   structured (SQLite or a small binary format), and key records by
-   package name so unpin can be requested per-package.
-3. **Lifecycle integration**: replace the CLI driver with a
-   long-running service that subscribes to `ACTION_PACKAGE_REPLACED`,
-   `ACTION_PACKAGE_REMOVED`, and an OAT-regeneration signal, and
-   re-pins or unpins accordingly.
-4. **Pin region budget management**: when pin region is at capacity,
-   evict the least-recently-launched app's pins before adding a new
-   one. A simple LRU keyed on per-app launch timestamps from
-   `usagestats` is a reasonable first pass.
-5. **SELinux policy**: the daemon needs a vendor domain with the
-   capabilities to open every relevant inode under `/data/app`, issue
-   the F2FS pin ioctl, read FIEMAP, and access the UFS pin path.
-6. **init.rc service definition**: standard Android service plumbing
-   so the daemon starts at boot and is restarted on crash.
-7. **Telemetry**: per-app pin success/failure counts, pin region
-   utilization, time-since-last-pin per app. OEMs need this for
-   tuning.
+The core — the four-step per-file sequence in `pin_files()`, the
+two discovery functions, and the shared command dispatch — does not
+change.
 
-The core of the implementation — the four-step per-file sequence in
-`cmd_pin()` — does not change. It is the same sequence whether the
-caller is a CLI tool, a system service, or a kernel module.
+## 11.8 A note on C versus C++
 
+The implementation is C. C++ would offer `std::string`,
+`std::vector<std::string>`, `std::filesystem::directory_iterator`,
+RAII for `FILE *` and `int fd`. The wins are modest for a 600-line
+tool; the cost is a `libstdc++`/`libc++` dependency in the shipped
+binary. The ioctl-heavy parts (FIEMAP, F2FS pin, vendor UFS interface)
+are no cleaner in C++ than in C. Staying in C keeps dependencies
+minimal and matches the style of the surrounding kernel-adjacent
+tooling. If a future version of the tool grows complex in-memory
+state — pin index with secondary keys for eviction policy, dependency
+graphs between pins — that's the point at which C++ rewrite would
+start paying for itself.
+
+---
+
+# 12. Cold-launch I/O — what actually hits disk
+
+This section captures the observability work done during validation
+and the conclusions it produced about FBO 3.0's scope. The findings
+are non-obvious and worth recording because they explain why the
+static-pin architecture is correct even though it appears, at first
+glance, to address only a small fraction of an app's file mappings.
+
+## 12.1 Why `strace` on `am start` is misleading
+
+A natural first attempt at "what files does Antutu open?" is:
+
+```bash
+strace -f -e openat am start -n <pkg>/<activity>
+```
+
+This produces a thousand-line trace dominated by paths under
+`/dev/__properties__/`, `/system/lib64/`, `/odm/lib64/`,
+`/vendor/lib64/`, `/apex/com.android.*/lib64/`. None of those are
+Antutu's files.
+
+The reason: `am` is a small CLI binary that sends a Binder message to
+`system_server`. `system_server` then asks `zygote64` to fork a new
+process, which becomes the app. The fork happens **after `am` has
+already exited**. So the strace captures only `am`'s own startup —
+the dynamic linker resolving `am`'s shared library dependencies,
+Bionic property service touches — and never sees the app process at
+all.
+
+This is also why `wrap.<package>` with strace tends to fail in
+practice: it changes the launch path from a fork to an exec, breaks
+Zygote's expectations about the child's process state, and the app
+ends up crashing or being killed as ANR-adjacent before its real
+loads happen.
+
+## 12.2 The Zygote architecture
+
+The relevant Android internals:
+
+At boot, `zygote64` (and on dual-ABI devices, `zygote` for 32-bit)
+starts. It does several things, then sits idle:
+
+1. Maps the boot image: `/system/framework/<isa>/boot.art`,
+   `boot.oat`, `boot.vdex`, plus a long list of related `boot-*` files.
+2. Loads the framework JARs and their corresponding OAT artifacts —
+   `framework.jar` and `framework.oat`, plus dozens of others.
+3. `dlopen`s every commonly-used native library — `libart.so`,
+   `libbinder.so`, `libgui.so`, `libsqlite.so`, codec libs, etc.
+4. Pre-resolves a curated set of classes and methods (the "preload
+   classes" list).
+5. Waits on a socket for app-launch requests from `system_server`.
+
+When an app is launched, Zygote does NOT exec a new binary. It does
+`fork()`, the child specializes itself (sets SELinux context,
+sandboxes, calls into the activity main), and runs as the app. All of
+Zygote's prior memory mappings — the entire framework, every preloaded
+`.so`, the boot image — are inherited by the child via standard
+copy-on-write semantics.
+
+For read-only sections of those files (which is essentially all of
+them), the inherited mappings reference the *same physical pages in
+RAM* as Zygote. No I/O is done at app launch to read those files —
+they are already resident, and the new process has a virtual mapping
+to the same physical memory.
+
+This means:
+
+- A file appearing in `/proc/$PID/maps` does **not** imply that file
+  was read from disk during this app's launch.
+- The framework's bytes are paid once, at boot, by Zygote.
+- Every app launch after that inherits the warmth for free.
+
+## 12.3 `/proc/<pid>/maps` as the ground-truth tool
+
+For "what files is this app using right now," `/proc/<pid>/maps` is
+both more accurate and easier than tracing. Every file the app uses
+for code or resources is mmap'd (APKs, OAT, .so, all of it), and
+mmap'd files persist in the map until close. So a snapshot taken
+after launch settles gives the complete file set.
+
+```bash
+PID=$(pidof com.antutu.ABenchMark)
+cat /proc/$PID/maps | awk '{print $NF}' | sort -u | grep '/data/app/'
+```
+
+This is what `fbo_pin observe` does in C, and what `fbo_inspect.sh`
+formats with size and category breakdowns.
+
+The C application uses this in `read_proc_maps()` (Section 11.3).
+
+## 12.4 Interpreting the app vs framework byte ratio
+
+A typical measurement on a modern Android device, for a benchmark or
+moderate-sized app:
+
+```
+/data/app/         ~ 100-300 MB     (per-app, cold on first launch)
+/system/ + /apex/  ~ 200-400 MB     (framework, already warm via Zygote)
+/data/data/        ~  10-50  MB     (runtime data, mostly small writes)
+/data/dalvik-cache ~ 100-200 MB     (boot OAT, already warm via Zygote)
+```
+
+It is tempting to compute "app share = `/data/app/` / total" and worry
+that the number is small. That number is **misleading**. The correct
+denominator for "what fraction of cold-launch I/O does FBO address?"
+is not total mapped bytes but cold mapped bytes.
+
+By construction:
+
+- `/data/app/` is cold the first time the app launches after page
+  cache eviction. Every byte is real disk I/O.
+- `/system/` and `/apex/` are pre-mapped by Zygote at boot. Cold I/O
+  cost during app launch is approximately zero.
+- `/data/dalvik-cache/` is pre-mapped by Zygote for the boot image
+  set. Same as above.
+- `/data/data/` involves writes more than reads, and the reads tend
+  to be small and lazy. Marginal contribution to cold launch.
+
+So the "app share of cold-launch I/O" is closer to **near-100%** of
+what FBO 3.0 actually has the leverage to optimize. The remaining
+~0% is platform-level pinning (boot image, framework) which is the
+OEM's responsibility at platform integration time and is typically
+already addressed by the time FBO 3.0 ships.
+
+## 12.5 When the assumption breaks
+
+The "framework is always in RAM via Zygote" assumption is robust but
+not absolute. Cases where it fails:
+
+1. **First app launch after cold boot.** Zygote pays the framework
+   load cost once. The very first app launch post-boot inherits a
+   freshly-loaded Zygote, but the kernel hasn't fully filled the
+   working set yet. The next several launches pay a small amortized
+   cost as Zygote's preload set finishes faulting in.
+2. **Lazily-loaded platform libraries.** Codec libs for unusual codecs,
+   ML accelerator drivers, certain `dex2oat` plugins — these are not
+   in Zygote's preload set and get loaded on first use. The cost is
+   amortized over the device's lifetime, not per-app.
+3. **Severe memory pressure.** On low-RAM devices under heavy
+   multitasking, the kernel can evict clean file-backed pages
+   despite high reference counts. Zygote's mappings are partially
+   protected (high refcount, frequent reuse), but not guaranteed.
+4. **Background `dex2oat` regeneration.** After OTAs or install
+   updates, the system may rewrite `.odex` files in the background.
+   The new file's pages are not yet cached; first launch after
+   regeneration is colder than usual.
+
+None of these change the FBO 3.0 design. They are real costs that
+exist alongside FBO and are addressed (or accepted) elsewhere in the
+platform.
+
+## 12.6 What this means for FBO 3.0 scope
+
+The architecture that falls out of this analysis:
+
+- FBO 3.0 pins **per-app distribution files** under `/data/app/`.
+- It does **not** pin framework files. Those are platform-level.
+- It does **not** pin runtime data files. Those are out of scope.
+- The per-app pin region budget can be small (low hundreds of MB per
+  app), because the set of files per app is small.
+- The pin region budget can be amortized across many apps with LRU
+  eviction, because most apps launch on a long-tail distribution
+  while a small set of "hot" apps gets ~all the launches.
+
+This is exactly the per-app distribution-file pin that the
+`fbo_pin app` subcommand implements.
+
+---
+
+# 13. Two discovery paths
+
+The C application exposes two ways to determine which files to pin for
+a given package. They are complementary and the tool ships with both.
+
+## 13.1 Static enumeration: `fbo_pin app`
+
+Implementation: `enumerate_package()` in `fbo_pin.c`.
+
+Steps:
+
+1. Call `pm path <package>` via `popen()`. Strip `package:` prefix
+   from each output line. This yields `base.apk` and every installed
+   split.
+2. Derive the install directory by taking `dirname()` of the first
+   APK path.
+3. Read `ro.product.cpu.abi` via `getprop`, map to ISA short form
+   (`arm64-v8a` -> `arm64`, etc.).
+4. List `<install-dir>/oat/<isa>/*` — these are the AOT compiled
+   artifacts (`.odex`, `.vdex`, `.art`).
+5. List `<install-dir>/lib/<isa>/*` — extracted native libraries, if
+   the app has `extractNativeLibs="true"` in its manifest. For
+   modern apps with `extractNativeLibs="false"`, this directory does
+   not exist and the libs are mmap'd directly from inside the APK.
+
+Result: typically 6-15 absolute paths.
+
+Properties: fast (milliseconds), no app launch required, no side
+effects, deterministic given a particular install.
+
+When to use: production. This is what an OEM service calls on
+`ACTION_PACKAGE_REPLACED` or at hot-list boot setup.
+
+## 13.2 Runtime observation: `fbo_pin observe`
+
+Implementation: `cmd_observe()` in `fbo_pin.c`.
+
+Steps:
+
+1. Resolve the launchable activity via
+   `cmd package resolve-activity --brief`, or accept it as an
+   argument.
+2. `am force-stop` the package, sleep briefly.
+3. `am start` the resolved activity.
+4. Poll `pidof <package>` for up to 10 seconds to wait for the
+   process to appear.
+5. Sleep 3 seconds to let launch-phase mmaps complete.
+6. Open `/proc/<pid>/maps`, parse the last whitespace-separated
+   field of each line, dedupe, filter to paths under `/data/app/`.
+7. Pin each file using the same `pin_files()` backend.
+
+Result: typically the same 6-15 paths, plus any additional
+`/data/app/`-rooted files the app loads at runtime that static
+enumeration missed.
+
+Properties: requires an app launch (the launch itself is cold; the
+pin benefits subsequent launches). Captures ground truth — anything
+the app actually maps appears in `/proc/<pid>/maps`.
+
+When to use: validation, refinement, debugging. Run it once per app
+or per Android version to confirm the static path is complete; if it
+isn't, that's a static-path bug to fix.
+
+## 13.3 When to use which
+
+| Scenario | Path |
+|---|---|
+| Production pin on package install | `app` |
+| Production pin on system boot | `app` |
+| Validating the static path is complete | `observe`, then `diff` against `app` |
+| Investigating a new Android version's file layout | `observe` |
+| Investigating an app that loads files via unusual paths | `observe` |
+| One-shot pin from a CLI on a dev device | either |
+
+The `diff` workflow:
+
+```bash
+./fbo_pin app     /tmp/static.rec  com.antutu.ABenchMark
+./fbo_pin unpin   /tmp/static.rec
+./fbo_pin observe /tmp/observed.rec com.antutu.ABenchMark
+
+./fbo_pin list /tmp/static.rec   | grep '^FILE ' | awk '{print $2}' | sort > /tmp/s.txt
+./fbo_pin list /tmp/observed.rec | grep '^FILE ' | awk '{print $2}' | sort > /tmp/o.txt
+diff /tmp/s.txt /tmp/o.txt
+```
+
+Empty diff means static enumeration is correct and complete for this
+app. Any difference is actionable — extend `enumerate_package()` or
+treat the app as an exception.
+
+## 13.4 Shared pin backend
+
+Both modes call into `pin_files()`. Per file, the sequence is:
+
+```
+open(path, O_RDONLY)
+fstat(fd, &st)                                   // for record metadata
+ioctl(fd, F2FS_IOC_SET_PIN_FILE, &one)           // prevent F2FS GC
+ioctl(fd, FS_IOC_FIEMAP, &fm)                    // get LBA extents
+ufs_vendor_pin(extents)                          // STUB; OEM-specific
+record_write(rec, path, ino, mtime, extents)    // for later unpin
+close(fd)
+```
+
+The only OEM-specific code is `ufs_vendor_pin()`. Everything else is
+standard Linux. Wiring the stub to the real pin interface is the only
+work required to make either discovery mode produce real pins on a
+real device.
+
+---
+
+# 14. Required files and tools
+
+This section is an inventory: the complete set of files needed to
+build, deploy, and use FBO 3.0 as documented here.
+
+## 14.1 Source files
+
+| File | Purpose | Lines | Required? |
+|---|---|---|---|
+| `fbo_pin.c` | The C tool implementing all five subcommands. | ~600 | Yes |
+| `fbo_enum.sh` | Shell-only static enumeration. Same logic as `fbo_pin app`. | ~25 | Optional |
+| `fbo_inspect.sh` | Runtime byte-breakdown analysis tool. | ~80 | Recommended for validation |
+
+## 14.2 Build artifacts
+
+| Artifact | How built | Where it runs |
+|---|---|---|
+| `fbo_pin` (x86 binary) | `gcc -O2 -Wall -o fbo_pin fbo_pin.c` | Linux workstation, for local testing of pin/list/unpin |
+| `fbo_pin` (arm64 Android binary) | NDK clang cross-compile | Android device |
+
+The same `fbo_pin.c` source compiles to both. There are no
+architecture-specific code paths; all the Android-specific behavior is
+factored through helpers (`popen("pm path ...")`,
+`popen("getprop ...")`, `read_proc_maps`) which return clean errors
+on non-Android hosts.
+
+## 14.3 Runtime prerequisites on Android
+
+| Item | Where it comes from | Why |
+|---|---|---|
+| Root access | adb root, or device console as root | Required for all ioctl operations and `/proc/<pid>/maps` reading across SELinux domains |
+| `pm` binary | Android platform (always present) | Used by `fbo_pin app` for static enumeration |
+| `am` binary | Android platform (always present) | Used by `fbo_pin observe` to launch apps |
+| `getprop` binary | Android platform (always present) | Used to read `ro.product.cpu.abi` |
+| `cmd` binary | Android platform (Android 7+) | Used by `fbo_pin observe` for `cmd package resolve-activity` |
+| F2FS filesystem at `/data` | Android default since ~Android 8 | For `F2FS_IOC_SET_PIN_FILE` to take effect; on ext4 the pin is silently no-op'd |
+| `CONFIG_F2FS_FS_PIN` in kernel | OEM kernel build | Enables the pin ioctl in F2FS |
+| OEM UFS pin interface | OEM-specific | The actual binding for `ufs_vendor_pin()` — sysfs node, scsi passthrough, or vendor ioctl |
+
+## 14.4 Validation workflow
+
+To validate FBO 3.0 end-to-end on a dev device:
+
+```
+# 1. Build and deploy
+gcc -O2 -Wall -o fbo_pin fbo_pin.c            # or NDK cross-compile
+adb push fbo_pin fbo_inspect.sh /data/local/tmp/
+adb shell chmod +x /data/local/tmp/fbo_pin /data/local/tmp/fbo_inspect.sh
+
+# 2. Inspect the target app's footprint
+adb shell /data/local/tmp/fbo_inspect.sh com.antutu.ABenchMark
+# Read: app share of mapped bytes, file list, top largest files
+
+# 3. Compare static vs observed enumeration
+adb shell /data/local/tmp/fbo_pin app     /data/local/tmp/s.rec com.antutu.ABenchMark
+adb shell /data/local/tmp/fbo_pin unpin   /data/local/tmp/s.rec
+adb shell /data/local/tmp/fbo_pin observe /data/local/tmp/o.rec com.antutu.ABenchMark
+
+# 4. Pin and A/B measure cold launch time
+adb shell /data/local/tmp/fbo_pin unpin /data/local/tmp/o.rec
+
+# Unpinned baseline
+for i in 1 2 3 4 5; do
+    adb shell am force-stop com.antutu.ABenchMark
+    adb shell 'echo 3 > /proc/sys/vm/drop_caches'
+    adb shell am start -W -n com.antutu.ABenchMark/com.android.module.app.ui.start.ABenchMarkStart \
+        | grep -E 'TotalTime|WaitTime'
+    sleep 3
+done
+
+# Pinned
+adb shell /data/local/tmp/fbo_pin app /data/local/tmp/p.rec com.antutu.ABenchMark
+for i in 1 2 3 4 5; do
+    adb shell am force-stop com.antutu.ABenchMark
+    adb shell 'echo 3 > /proc/sys/vm/drop_caches'
+    adb shell am start -W -n com.antutu.ABenchMark/com.android.module.app.ui.start.ABenchMarkStart \
+        | grep -E 'TotalTime|WaitTime'
+    sleep 3
+done
+
+# Tear down
+adb shell /data/local/tmp/fbo_pin unpin /data/local/tmp/p.rec
+```
+
+The delta in median `TotalTime` between the two batches is the
+end-to-end evidence for FBO 3.0's impact.
+
+## 14.5 Summary of the work
+
+- **`fbo_pin.c`** is the C application. Five subcommands, one shared
+  pin backend, two discovery modes (static and runtime). Ships as a
+  single binary, no library dependencies, ~600 lines.
+- **`fbo_enum.sh`** is the equivalent shell-only enumerator. Helpful
+  on devices without the binary, optional otherwise.
+- **`fbo_inspect.sh`** is the analysis tool that produced the
+  app-vs-framework byte-ratio measurements used to validate FBO
+  3.0's scope.
+- The architectural conclusion — pin `/data/app/` per-app, leave
+  `/system/` to the platform — is grounded in the Zygote sharing
+  model documented in Section 12.
+- The reference implementation needs exactly one substitution to be
+  production-ready: wiring `ufs_vendor_pin()` to the OEM pin
+  interface.

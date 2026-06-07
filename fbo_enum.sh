@@ -35,6 +35,9 @@ echo "$APKS"
 ls "$DIR/oat/$ISA"/* 2>/dev/null
 
 # Extracted native libs, if the app uses extractNativeLibs="true".
-# Apps that mmap libs out of the APK directly will have no /lib/ dir;
-# pinning the APK already covers those libs.
-ls "$DIR/lib/$ABI"/* 2>/dev/null
+# The extracted-on-disk directory uses the short ISA name (arm64),
+# NOT the full ABI name (arm64-v8a) — the ABI form only appears
+# inside the APK's ZIP entries. Apps that mmap libs straight out
+# of the APK have no on-disk /lib/ directory; pinning the APK
+# already covers those libs.
+ls "$DIR/lib/$ISA"/* 2>/dev/null
