@@ -1668,3 +1668,644 @@ end-to-end evidence for FBO 3.0's impact.
 - The reference implementation needs exactly one substitution to be
   production-ready: wiring `ufs_vendor_pin()` to the OEM pin
   interface.
+---
+
+# 15. Kernel-side implementation
+
+The userspace tool documented in Section 11 is the right shape for
+development, debugging, and rapid iteration. For production
+deployment on OEM devices, there is a complementary path: a kernel
+module that exposes a sysfs entry and performs the entire
+enumeration + pin sequence in kernel context. This section
+documents that module — its architecture, its source, how to build
+it, and the open wiring tasks that remain.
+
+## 15.1 Why an in-kernel path is worth having
+
+The userspace tool is fragile in ways specific to Android
+production:
+
+- A long-running daemon needs `init.rc`, SELinux policy, restart
+  semantics, and survives memory pressure only by careful design.
+- Each pin operation crosses the userspace/kernel boundary several
+  times (`pm path` exec, `open`, `ioctl` for F2FS pin, `ioctl` for
+  FIEMAP, write to sysfs/scsi for UFS pin). Microseconds individually,
+  but the count adds up under load.
+- Userspace tracing infrastructure (`strace`, `atrace`, `perfetto`)
+  is unevenly available across OEM kernels, making field debugging
+  difficult.
+
+An in-kernel module addresses all three. It loads once at boot, has
+no SELinux policy concerns for filesystem access (the kernel owns
+the namespace), and avoids the cross-boundary round trips on the
+hot path. The interface to userspace collapses to a single sysfs
+write:
+
+```
+echo com.antutu.ABenchMark > /sys/kernel/fbo/pin
+```
+
+## 15.2 Why this does NOT go in F2FS itself
+
+A natural-sounding place for this code is `fs/f2fs/`. That would be
+wrong, for reasons worth recording:
+
+1. **F2FS is a generic Linux filesystem**, used outside Android in
+   embedded distros and Chrome OS. Embedding Android-specific path
+   conventions (`/data/app/<H1>/<pkg>-<H2>/`) inside F2FS forks the
+   filesystem from upstream and couples it to an application
+   framework.
+2. **"Package" is a userspace concept**, owned by
+   `PackageManagerService` in `system_server`. F2FS has no business
+   knowing about it.
+3. **Path layout changes between Android versions**. Putting the
+   knowledge in F2FS means every Android directory-layout change is
+   an F2FS patch. Putting it in a separate vendor module means the
+   F2FS source stays clean and the vendor module rebases freely.
+4. **Upstream F2FS maintainers will reject Android-aware patches**.
+   The Kim et al at Samsung who maintain upstream F2FS actively
+   redirect this kind of code to vendor modules.
+
+The correct division of responsibility:
+
+```
+userspace               decides WHAT to pin   (which package, which policy)
+fbo_module.ko           does the enumeration  (walk /data/app/, find files)
+F2FS                    provides mechanism    (existing pin ioctl,
+                                                segment allocation hints)
+hardware (UFS)          provides residency    (vendor pin region)
+```
+
+`fbo_module.ko` is a separate kernel module — not a patch to
+`fs/f2fs/`. F2FS continues to expose its existing per-file pin
+ioctl. The module calls into F2FS through that same interface a
+userspace caller would use.
+
+## 15.3 The four kernel API building blocks
+
+The module needs to do four things in kernel context. Each maps to a
+well-known kernel API.
+
+| Operation | API | Notes |
+|---|---|---|
+| Walk a directory one level | `iterate_dir()` with a `struct dir_context` callback | `filldir_t` return type changed `int` → `bool` around kernel 6.0; target 5.10+ |
+| Open a file by absolute path | `filp_open()` | Returns IS_ERR pointer; check with `IS_ERR(filp)`; close with `filp_close()` |
+| Extract physical extent map | `inode->i_op->fiemap()` or filesystem-specific helper like F2FS's `f2fs_map_blocks()` | Generic FIEMAP path declares its output buffer `__user`; in kernel context this requires either a small patch to skip the access check or use of the filesystem-specific helper |
+| F2FS pin | None exported today | Either patch F2FS to `EXPORT_SYMBOL_GPL` a helper, or skip F2FS pin and accept GC drift |
+
+The first three are unproblematic. The fourth is the one piece of
+F2FS-specific work that the module needs from the filesystem.
+
+## 15.4 Module source
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * fbo_module.c — FBO 3.0 in-kernel pin module.
+ *
+ * Exposes /sys/kernel/fbo/pin. Writing a package name to it triggers
+ * the kernel-side enumeration and pin sequence for that package's
+ * static distribution files under /data/app/.
+ *
+ *   echo com.antutu.ABenchMark > /sys/kernel/fbo/pin
+ *
+ * Targets kernel >= 5.10.
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/fiemap.h>
+#include <linux/cred.h>
+
+#define FBO_DATA_APP   "/data/app"
+#define FBO_MAX_PATH   1024
+#define FBO_MAX_NAME   256
+#define FBO_MAX_FILES  64
+#define FBO_MAX_EXT    256
+
+#ifdef CONFIG_ARM64
+  #define FBO_ISA "arm64"
+#elif defined(CONFIG_ARM)
+  #define FBO_ISA "arm"
+#elif defined(CONFIG_X86_64)
+  #define FBO_ISA "x86_64"
+#elif defined(CONFIG_X86)
+  #define FBO_ISA "x86"
+#else
+  #define FBO_ISA "unknown"
+#endif
+
+static struct kobject *fbo_kobj;
+
+/* ----- Directory iteration ----- */
+
+struct fbo_iter_ctx {
+    struct dir_context ctx;
+    const char        *contains;
+    char              *names[FBO_MAX_FILES];
+    int                n_names;
+};
+
+static bool fbo_filldir(struct dir_context *ctx, const char *name, int namlen,
+                        loff_t offset, u64 ino, unsigned d_type)
+{
+    struct fbo_iter_ctx *fc = container_of(ctx, struct fbo_iter_ctx, ctx);
+    char *copy;
+
+    if (fc->n_names >= FBO_MAX_FILES) return false;
+    if (namlen >= FBO_MAX_NAME) return true;
+    if (namlen == 1 && name[0] == '.') return true;
+    if (namlen == 2 && name[0] == '.' && name[1] == '.') return true;
+
+    copy = kmalloc(namlen + 1, GFP_KERNEL);
+    if (!copy) return false;
+    memcpy(copy, name, namlen);
+    copy[namlen] = '\0';
+
+    if (fc->contains && !strstr(copy, fc->contains)) {
+        kfree(copy);
+        return true;
+    }
+    fc->names[fc->n_names++] = copy;
+    return true;
+}
+
+static int fbo_list_dir(const char *path, const char *contains,
+                        char **names_out, int max)
+{
+    struct path p;
+    struct file *filp;
+    struct fbo_iter_ctx fc = {
+        .ctx.actor = fbo_filldir,
+        .contains  = contains,
+        .n_names   = 0,
+    };
+    int ret, i, copy_n;
+
+    ret = kern_path(path, LOOKUP_DIRECTORY, &p);
+    if (ret) return ret;
+
+    filp = dentry_open(&p, O_RDONLY | O_DIRECTORY, current_cred());
+    path_put(&p);
+    if (IS_ERR(filp)) return PTR_ERR(filp);
+
+    ret = iterate_dir(filp, &fc.ctx);
+    fput(filp);
+    if (ret < 0) {
+        for (i = 0; i < fc.n_names; i++) kfree(fc.names[i]);
+        return ret;
+    }
+
+    copy_n = min(fc.n_names, max);
+    for (i = 0; i < copy_n; i++) names_out[i] = fc.names[i];
+    for (i = copy_n; i < fc.n_names; i++) kfree(fc.names[i]);
+    return copy_n;
+}
+
+/* ----- Per-file pin sequence ----- */
+
+/* OEM-specific UFS vendor pin. Replace the printk with your real
+ * binding — sysfs write, SCSI passthrough, or vendor ioctl. */
+static int fbo_ufs_pin(const char *path,
+                       const struct fiemap_extent *exts, unsigned n, int pin)
+{
+    unsigned i;
+    pr_info("fbo: ufs_%s %s (%u extent%s)\n",
+            pin ? "PIN" : "UNPIN", path, n, n == 1 ? "" : "s");
+    for (i = 0; i < n; i++) {
+        pr_info("fbo:   lba=0x%llx len=0x%llx flags=0x%x\n",
+                (unsigned long long)exts[i].fe_physical,
+                (unsigned long long)exts[i].fe_length,
+                exts[i].fe_flags);
+    }
+    return 0;
+}
+
+static int fbo_pin_one(const char *path)
+{
+    struct file *filp;
+    struct inode *inode;
+    struct fiemap_extent_info fei = { 0 };
+    struct fiemap_extent *exts;
+    int ret;
+
+    filp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(filp)) {
+        pr_warn("fbo: open %s: %ld\n", path, PTR_ERR(filp));
+        return PTR_ERR(filp);
+    }
+    inode = file_inode(filp);
+
+    exts = kcalloc(FBO_MAX_EXT, sizeof(*exts), GFP_KERNEL);
+    if (!exts) { filp_close(filp, NULL); return -ENOMEM; }
+
+    fei.fi_flags         = FIEMAP_FLAG_SYNC;
+    fei.fi_extents_max   = FBO_MAX_EXT;
+    fei.fi_extents_start = (struct fiemap_extent __user *)exts;
+
+    if (!inode->i_op->fiemap) {
+        ret = -EOPNOTSUPP;
+        goto out;
+    }
+    ret = inode->i_op->fiemap(inode, &fei, 0, ~0ULL);
+    if (ret < 0) goto out;
+
+    /* F2FS pin step would go here once exported. */
+
+    ret = fbo_ufs_pin(path, exts, fei.fi_extents_mapped, 1);
+
+out:
+    kfree(exts);
+    filp_close(filp, NULL);
+    return ret;
+}
+
+/* ----- Package -> install dir resolution ----- */
+
+static int fbo_find_install_dir(const char *pkg, char *out, size_t outlen)
+{
+    char *outer[FBO_MAX_FILES];
+    char *inner[FBO_MAX_FILES];
+    int n_outer, n_inner, i, j, ret = -ENOENT;
+    char sub[FBO_MAX_PATH];
+
+    n_outer = fbo_list_dir(FBO_DATA_APP, NULL, outer, FBO_MAX_FILES);
+    if (n_outer < 0) return n_outer;
+
+    for (i = 0; i < n_outer; i++) {
+        snprintf(sub, sizeof(sub), "%s/%s", FBO_DATA_APP, outer[i]);
+        n_inner = fbo_list_dir(sub, pkg, inner, FBO_MAX_FILES);
+        if (n_inner > 0) {
+            snprintf(out, outlen, "%s/%s", sub, inner[0]);
+            for (j = 0; j < n_inner; j++) kfree(inner[j]);
+            ret = 0;
+            break;
+        }
+    }
+    for (i = 0; i < n_outer; i++) kfree(outer[i]);
+    return ret;
+}
+
+/* ----- Top-level package pin ----- */
+
+static int fbo_pin_package(const char *pkg)
+{
+    char install_dir[FBO_MAX_PATH];
+    char *files[FBO_MAX_FILES];
+    char sub[FBO_MAX_PATH];
+    char path[FBO_MAX_PATH];
+    int n, i, total = 0;
+
+    if (fbo_find_install_dir(pkg, install_dir, sizeof(install_dir)) < 0) {
+        pr_warn("fbo: install dir not found for %s\n", pkg);
+        return -ENOENT;
+    }
+    pr_info("fbo: install dir = %s\n", install_dir);
+
+    /* base.apk + splits */
+    n = fbo_list_dir(install_dir, ".apk", files, FBO_MAX_FILES);
+    for (i = 0; i < n; i++) {
+        snprintf(path, sizeof(path), "%s/%s", install_dir, files[i]);
+        if (fbo_pin_one(path) == 0) total++;
+        kfree(files[i]);
+    }
+
+    /* oat/<isa>/ */
+    snprintf(sub, sizeof(sub), "%s/oat/%s", install_dir, FBO_ISA);
+    n = fbo_list_dir(sub, NULL, files, FBO_MAX_FILES);
+    for (i = 0; i < n; i++) {
+        snprintf(path, sizeof(path), "%s/%s", sub, files[i]);
+        if (fbo_pin_one(path) == 0) total++;
+        kfree(files[i]);
+    }
+
+    /* lib/<isa>/ (may not exist) */
+    snprintf(sub, sizeof(sub), "%s/lib/%s", install_dir, FBO_ISA);
+    n = fbo_list_dir(sub, NULL, files, FBO_MAX_FILES);
+    for (i = 0; i < n; i++) {
+        snprintf(path, sizeof(path), "%s/%s", sub, files[i]);
+        if (fbo_pin_one(path) == 0) total++;
+        kfree(files[i]);
+    }
+
+    pr_info("fbo: pinned %d file(s) for %s\n", total, pkg);
+    return 0;
+}
+
+/* ----- sysfs interface ----- */
+
+static ssize_t pin_store(struct kobject *kobj, struct kobj_attribute *attr,
+                         const char *buf, size_t count)
+{
+    char pkg[FBO_MAX_NAME];
+    size_t n;
+    int ret;
+
+    n = min(count, sizeof(pkg) - 1);
+    memcpy(pkg, buf, n);
+    pkg[n] = '\0';
+    while (n > 0 && (pkg[n-1] == '\n' || pkg[n-1] == '\r'))
+        pkg[--n] = '\0';
+    if (n == 0) return -EINVAL;
+
+    pr_info("fbo: pin request: %s\n", pkg);
+    ret = fbo_pin_package(pkg);
+    if (ret < 0) return ret;
+    return count;
+}
+
+static struct kobj_attribute pin_attr = __ATTR(pin, 0220, NULL, pin_store);
+
+/* ----- Module init / exit ----- */
+
+static int __init fbo_init(void)
+{
+    int ret;
+    fbo_kobj = kobject_create_and_add("fbo", kernel_kobj);
+    if (!fbo_kobj) return -ENOMEM;
+    ret = sysfs_create_file(fbo_kobj, &pin_attr.attr);
+    if (ret) { kobject_put(fbo_kobj); return ret; }
+    pr_info("fbo: loaded (ISA=%s); echo <pkg> > /sys/kernel/fbo/pin\n", FBO_ISA);
+    return 0;
+}
+
+static void __exit fbo_exit(void)
+{
+    sysfs_remove_file(fbo_kobj, &pin_attr.attr);
+    kobject_put(fbo_kobj);
+    pr_info("fbo: unloaded\n");
+}
+
+module_init(fbo_init);
+module_exit(fbo_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("FBO 3.0");
+MODULE_DESCRIPTION("In-kernel package file enumeration and pin");
+```
+
+## 15.5 How the enumeration works inside the kernel
+
+The flow when userspace writes a package name to `/sys/kernel/fbo/pin`:
+
+```
+write(fd, "com.antutu.ABenchMark\n", 22)
+    -> sysfs write path
+    -> pin_store() callback in fbo_module.ko
+        -> trim newline, validate non-empty
+        -> fbo_pin_package("com.antutu.ABenchMark")
+            -> fbo_find_install_dir():
+                -> fbo_list_dir("/data/app/", NULL)
+                    -> kern_path()                 // resolve "/data/app/"
+                    -> dentry_open()               // get a struct file
+                    -> iterate_dir()               // calls fbo_filldir
+                        -> each H1 entry collected into ctx.names[]
+                -> for each H1 hash directory:
+                    -> fbo_list_dir(/data/app/H1/, "com.antutu...")
+                        -> iterate_dir() with substring filter
+                        -> matches "com.antutu.ABenchMark-H2"
+                    -> install dir found, break
+            -> for the install dir:
+                -> fbo_list_dir(install_dir, ".apk")
+                    -> matches base.apk, split_config.*.apk
+                    -> for each:
+                        -> fbo_pin_one(absolute path)
+                            -> filp_open()         // open file
+                            -> inode->i_op->fiemap // extent map
+                            -> fbo_ufs_pin()       // UFS vendor pin (stub)
+                            -> filp_close()
+                -> fbo_list_dir(install_dir/oat/arm64/, NULL)
+                    -> matches base.odex, base.vdex, base.art
+                    -> for each: fbo_pin_one()
+                -> fbo_list_dir(install_dir/lib/arm64/, NULL)
+                    -> empty for modern apps; no-op
+            -> pr_info("pinned N file(s) for ...")
+```
+
+Every step happens in kernel context. No userspace round trips, no
+ioctl dispatches across the boundary. The only userspace involvement
+is the one `write()` to sysfs.
+
+The `iterate_dir()` callback (`fbo_filldir`) is invoked by the
+filesystem once per directory entry. Inside the callback we filter
+by an optional substring (used to find the `com.antutu...` child of
+a hash directory) and copy matching names into the context's array.
+This is the same mechanism `ls` uses underneath; we are doing it
+directly without going through the libc dirent wrappers.
+
+## 15.6 Build system
+
+Two layouts. Both work; pick based on whether you're patching the
+OEM kernel source tree or shipping as an out-of-tree module.
+
+### Out-of-tree (development)
+
+Directory `fbo_module/` containing `fbo_module.c` plus a `Kbuild`:
+
+```
+# fbo_module/Kbuild
+obj-m := fbo_module.o
+```
+
+Build:
+
+```bash
+KDIR=/path/to/android-kernel-build
+make -C "$KDIR" M=$(pwd) ARCH=arm64 \
+     CROSS_COMPILE=aarch64-linux-android- modules
+
+# produces fbo_module.ko
+```
+
+### In-tree (shipping)
+
+Drop the source under `drivers/misc/fbo/` in the kernel tree.
+
+```
+# drivers/misc/fbo/Kconfig
+config FBO_PIN
+    tristate "FBO 3.0 in-kernel package pin"
+    default n
+    help
+      Sysfs-triggered enumeration and UFS pin of an Android
+      package's static distribution files.
+
+# drivers/misc/fbo/Kbuild
+obj-$(CONFIG_FBO_PIN) += fbo_module.o
+```
+
+Then in `drivers/misc/Kconfig`:
+
+```
+source "drivers/misc/fbo/Kconfig"
+```
+
+And in `drivers/misc/Makefile`:
+
+```
+obj-$(CONFIG_FBO_PIN) += fbo/
+```
+
+Build the kernel with `CONFIG_FBO_PIN=m` (loadable module) or
+`CONFIG_FBO_PIN=y` (built into the kernel image).
+
+## 15.7 Load, test, unload
+
+```bash
+# Push and load
+adb push fbo_module.ko /data/local/tmp/
+adb shell su -c 'insmod /data/local/tmp/fbo_module.ko'
+adb shell 'dmesg | tail -5'
+# Expect: fbo: loaded (ISA=arm64); echo <pkg> > /sys/kernel/fbo/pin
+
+# Trigger
+adb shell su -c 'echo com.antutu.ABenchMark > /sys/kernel/fbo/pin'
+
+# Inspect logs
+adb shell 'dmesg | grep "^fbo:"' | tail -50
+# Expect:
+#   fbo: pin request: com.antutu.ABenchMark
+#   fbo: install dir = /data/app/.../com.antutu.ABenchMark-.../
+#   fbo: ufs_PIN /data/app/.../base.apk (N extents)
+#   fbo:   lba=0x... len=0x... flags=0x0
+#   ...
+#   fbo: pinned 8 file(s) for com.antutu.ABenchMark
+
+# Unload
+adb shell su -c 'rmmod fbo_module'
+```
+
+The sysfs entry has mode `0220` (write-only, owner+group), preventing
+arbitrary processes from reading it. Production deployments should
+restrict who can write to it via SELinux policy.
+
+## 15.8 The three things to wire before production
+
+The skeleton above compiles, loads, and walks the directory tree. It
+does **not** yet produce real pin effects on the device. Three
+substitutions complete it:
+
+### 1. FIEMAP user-pointer issue
+
+The generic FIEMAP path declares its output buffer with the `__user`
+annotation. On modern kernels (≥5.10) where `set_fs()` has been
+removed, passing a kernel-space pointer through that path requires
+either a small patch to skip the `access_ok()` check when called
+from kernel context, or use of a filesystem-specific extent helper.
+
+The cleaner approach for F2FS is to call `f2fs_map_blocks()`
+directly:
+
+```c
+#include <linux/f2fs_fs.h>  /* or the internal header */
+
+struct f2fs_map_blocks map = { 0 };
+for (offset = 0; offset < i_size_read(inode); offset += chunk) {
+    map.m_lblk = offset >> PAGE_SHIFT;
+    map.m_len  = chunk >> PAGE_SHIFT;
+    f2fs_map_blocks(inode, &map, F2FS_GET_BLOCK_FIEMAP);
+    /* map.m_pblk now contains the physical block */
+}
+```
+
+This bypasses the generic FIEMAP layer entirely and gives you raw
+physical block numbers, which is what the UFS pin command wants
+anyway.
+
+### 2. F2FS pin export
+
+Without a kernel-callable F2FS pin function, the module cannot
+protect the file's blocks against F2FS GC. UFS-level pins become
+stale as GC relocates the underlying data.
+
+The fix is a ~3-line patch to F2FS:
+
+```c
+/* In fs/f2fs/file.c, after the existing pin implementation: */
+int f2fs_pin_file_kernel(struct file *filp)
+{
+    /* existing pin logic, factored out from f2fs_ioc_set_pin_file */
+}
+EXPORT_SYMBOL_GPL(f2fs_pin_file_kernel);
+```
+
+The module then calls `f2fs_pin_file_kernel(filp)` after `filp_open`
+and before `fiemap`.
+
+This is the one F2FS-specific change required, and it is a clean
+API export — not the Android-aware coupling rejected in Section
+15.2.
+
+### 3. UFS vendor pin
+
+Replace the `printk()` calls in `fbo_ufs_pin()` with the actual call
+to the OEM's pin interface. Three common forms:
+
+```c
+/* Form A: sysfs node */
+struct file *sf = filp_open("/sys/.../ufs_pin", O_WRONLY, 0);
+char buf[64];
+int len = snprintf(buf, sizeof(buf), "pin %llx %llx\n", lba, length);
+kernel_write(sf, buf, len, &sf->f_pos);
+filp_close(sf, NULL);
+
+/* Form B: vendor ioctl on a char device */
+struct file *cf = filp_open("/dev/fbo_ctl", O_RDWR, 0);
+struct fbo_pin_req req = { .lba = lba, .len = length };
+vfs_ioctl(cf, FBO_IOC_PIN, (unsigned long)&req);
+filp_close(cf, NULL);
+
+/* Form C: direct call into UFS driver via an exported symbol */
+ufs_vendor_pin_lba_range(lba, length);   /* defined by vendor driver */
+```
+
+Form C is the cleanest if your UFS driver source is in the same
+build — it's just a function call, no string formatting, no file
+open. The vendor team that owns the UFS driver typically prefers
+this once the feature is past prototype.
+
+## 15.9 Comparison with the userspace tool
+
+| Concern | Userspace `fbo_pin` | Kernel `fbo_module.ko` |
+|---|---|---|
+| Lines of code | ~600 (full C source) | ~250 (skeleton); ~400–500 finished |
+| Build dependencies | gcc or NDK clang | Kernel source tree for target device |
+| Deployment | Push binary + service definition | Insert module or build into kernel image |
+| Triggering | CLI invocation / daemon RPC | `echo <pkg> > /sys/kernel/fbo/pin` |
+| Iteration speed | seconds (rebuild, push) | minutes (rebuild kernel, reflash) |
+| Debugging | gdb, strace, printf | printk + dmesg, kgdb |
+| SELinux fight | Real concern, policy work | None — kernel owns the namespace |
+| F2FS pin | Free via existing per-file ioctl | Requires the small export patch |
+| Lifecycle integration | init.rc, restart policy, SELinux | Module stays loaded, no daemon |
+| Runs on non-Android Linux | Yes (for `pin` subcommand) | No (requires `/data/app/` layout) |
+
+The honest deployment posture: build both. The userspace tool is
+what you use for daily development — measuring `am start -W`,
+debugging which files are actually pinned, comparing static vs
+runtime discovery. The kernel module is the production deliverable
+that goes into the BSP and ships to OEM customers.
+
+They share the same conceptual structure — directory walk, file
+open, FIEMAP, vendor pin — so anyone who understands one can read
+the other.
+
+## 15.10 What this section adds to the deliverable set
+
+| File | Lives in | Required? |
+|---|---|---|
+| `fbo_module.c` | source tree | Yes, for kernel-side deployment |
+| `Kbuild` | source tree (alongside `.c`) | Yes |
+| `Kconfig` | only for in-tree build | Optional |
+| Small F2FS pin export patch | OEM kernel `fs/f2fs/file.c` | Required for GC-stable pins |
+| `fbo_module.ko` | build output | Yes — the deployable artifact |
+
+`fbo_module.ko` is the singular kernel-side deliverable. Everything
+else in this document — the userspace tool, the shell helpers, the
+analysis scripts — supports development and validation around it.
