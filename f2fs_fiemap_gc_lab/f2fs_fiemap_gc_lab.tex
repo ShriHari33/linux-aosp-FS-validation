@@ -1,0 +1,448 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.8in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{enumitem}
+
+\title{Android F2FS FIEMAP GC Lab\\APK, ODEX, and VDEX Relocation Testing}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+The goal is to prove that Android package artifacts can keep the same content
+and inode while their FIEMAP physical extents change due to F2FS garbage
+collection.  The files of interest are normally:
+
+\begin{itemize}[nosep]
+\item \texttt{base.apk}
+\item split \texttt{*.apk} files
+\item \texttt{base.odex}
+\item \texttt{base.vdex}
+\end{itemize}
+
+The desired outcome is not an application-level rewrite.  A successful GC
+relocation result has these properties:
+
+\begin{itemize}[nosep]
+\item the SHA-256 hash before and after is identical;
+\item the device and inode before and after are identical;
+\item the FIEMAP physical extents differ;
+\item F2FS GC counters, especially moved-block counters, increase.
+\end{itemize}
+
+This distinction matters.  Game play or settings changes usually mutate app
+data, caches, shader caches, or save files.  They usually do not rewrite
+\texttt{base.apk}, \texttt{base.odex}, or \texttt{base.vdex}.  For these files,
+the interesting mechanism is F2FS moving still-valid blocks while reclaiming
+partially invalid sections.
+
+\section{Included Files}
+
+\begin{longtable}{p{0.32\linewidth}p{0.60\linewidth}}
+\textbf{File} & \textbf{Purpose} \\
+\hline
+\texttt{f2fs\_fiemap\_gc\_lab.py} &
+Host-side Python harness.  It drives \texttt{adb}, discovers target files,
+takes before/after snapshots, stages donor files, triggers GC, and writes a
+summary. \\
+\texttt{f2fs\_gc\_probe.c} &
+Small native helper.  It issues \texttt{FS\_IOC\_FIEMAP},
+\texttt{F2FS\_IOC\_GARBAGE\_COLLECT}, and
+\texttt{F2FS\_IOC\_GARBAGE\_COLLECT\_RANGE}. \\
+\texttt{Makefile} &
+Build targets for a host compile check, Android helper build, and this PDF. \\
+\texttt{README.md} &
+Short command reference. \\
+\end{longtable}
+
+\section{Prerequisites}
+
+\begin{itemize}
+\item A rooted Android device.
+\item Working \texttt{adb}.
+\item \texttt{/data} mounted as F2FS.
+\item Enough free space on \texttt{/data} for donor files.
+\item Android NDK if you want the recommended native helper.
+\end{itemize}
+
+The helper is strongly recommended.  Many Android builds do not ship
+\texttt{filefrag}, and there is no standard shell command for
+\texttt{F2FS\_IOC\_GARBAGE\_COLLECT\_RANGE}.  Without the helper, the harness can
+still collect package paths, hashes, stats, and F2FS sysfs counters, but FIEMAP
+comparison may not be possible.
+
+\section{Build the Helper}
+
+From the kernel tree:
+
+\begin{verbatim}
+cd tools/f2fs_fiemap_gc_lab
+export ANDROID_NDK_HOME=/path/to/android-ndk
+make android ANDROID_ARCH=arm64 ANDROID_API=30
+\end{verbatim}
+
+For a quick local compile check only:
+
+\begin{verbatim}
+make host
+\end{verbatim}
+
+The Android build produces:
+
+\begin{verbatim}
+tools/f2fs_fiemap_gc_lab/f2fs_gc_probe.android
+\end{verbatim}
+
+The harness pushes this binary to \texttt{/data/local/tmp/f2fs\_gc\_probe} when
+\texttt{--helper} is supplied.
+
+\section{Recommended Workflow: Controlled APK Install}
+
+This is the workflow to use when repeatability matters.
+
+\subsection{Why this path is better}
+
+F2FS segregates data by temperature and writes out of place.  Existing package
+artifacts may be sitting in full, cold, valid sections.  GC has little reason to
+move a fully valid section because it cannot reclaim useful space from it.
+
+The controlled install workflow stages donor files with APK-like extensions,
+keeps them alive during install, installs the target APK set, then removes the
+donors before GC.  The intended effect is:
+
+\begin{enumerate}[nosep]
+\item donor files enter the same cold-data allocation class as APK-like files;
+\item package artifacts are written while those donor allocations are present;
+\item donor deletion creates invalid blocks near package artifacts;
+\item GC now has a partially invalid section that may contain valid package
+      blocks;
+\item GC can move those valid package blocks and change FIEMAP.
+\end{enumerate}
+
+\subsection{Command}
+
+For split APKs, repeat \texttt{--install-apk}.  For one APK, provide one
+\texttt{--install-apk}.
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
+  --helper ./f2fs_gc_probe.android \
+  --install-apk /path/to/base.apk \
+  --install-apk /path/to/split_config.apk \
+  --range-gc \
+  --gc-one-trials 128 \
+  --gc-seconds 60 \
+  --donor-count 64 \
+  --donor-mib 4 \
+  --collect-segment-info
+\end{verbatim}
+
+If you want to remove the existing package first:
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
+  --helper ./f2fs_gc_probe.android \
+  --install-apk /path/to/base.apk \
+  --uninstall-first \
+  --range-gc
+\end{verbatim}
+
+\section{Existing Play Store Install Workflow}
+
+This is lower probability.  The harness cannot change how the package artifacts
+were originally allocated.  Donor writes after installation may create general
+GC pressure, but they may not dirty the sections containing the APK, ODEX, or
+VDEX files.
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
+  --helper ./f2fs_gc_probe.android \
+  --range-gc \
+  --gc-one-trials 128 \
+  --gc-seconds 60 \
+  --donor-count 64 \
+  --donor-mib 4
+\end{verbatim}
+
+If package discovery misses an artifact, add it explicitly:
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
+  --helper ./f2fs_gc_probe.android \
+  --extra-path /data/app/.../oat/arm64/base.odex \
+  --extra-path /data/app/.../oat/arm64/base.vdex \
+  --range-gc
+\end{verbatim}
+
+\section{What the Harness Does}
+
+\subsection{Step 1: Prove eligibility}
+
+For every target file, the harness captures:
+
+\begin{itemize}[nosep]
+\item \texttt{stat} output;
+\item SHA-256;
+\item FIEMAP extents through the helper, or \texttt{filefrag} if available;
+\item F2FS sysfs counters.
+\end{itemize}
+
+The result is stored under:
+
+\begin{verbatim}
+snapshots/before.json
+snapshots/after.json
+summary.txt
+summary.json
+\end{verbatim}
+
+A file is considered relocated only when the content hash and inode remain
+stable while the FIEMAP extent signature changes.
+
+\subsection{Step 2: Manufacture partially invalid sections}
+
+The donor-file strategy is controlled by:
+
+\begin{verbatim}
+--donor-dir /data/local/tmp/f2fs_gc_lab_donors
+--donor-count 64
+--donor-mib 4
+--donor-exts apk,vdex,odex
+\end{verbatim}
+
+Each donor round creates one file per extension.  With the values above, the
+temporary donor footprint is approximately:
+
+\begin{verbatim}
+64 rounds * 4 MiB * 3 extensions = 768 MiB
+\end{verbatim}
+
+Tune this for the free space on the device.  The default is smaller:
+
+\begin{verbatim}
+12 rounds * 8 MiB * 3 extensions = 288 MiB
+\end{verbatim}
+
+\subsection{Step 3: Force ART state before baseline}
+
+Unless \texttt{--skip-dexopt} is supplied, the harness runs:
+
+\begin{verbatim}
+cmd package compile -m speed -f your.package.name
+\end{verbatim}
+
+This is done before the baseline snapshot so the test focuses on GC relocation,
+not normal ART regeneration of ODEX or VDEX files.
+
+\subsection{Step 4: Trigger GC}
+
+The harness can use three GC paths.
+
+\begin{itemize}
+\item \texttt{--range-gc}: calls the helper's
+      \texttt{F2FS\_IOC\_GARBAGE\_COLLECT\_RANGE} path for each target extent.
+\item \texttt{--gc-one-trials N}: calls ordinary
+      \texttt{F2FS\_IOC\_GARBAGE\_COLLECT} repeatedly through the helper.
+\item \texttt{gc\_urgent}: writes F2FS sysfs knobs such as
+      \texttt{gc\_urgent}, \texttt{gc\_urgent\_sleep\_time}, and
+      \texttt{gc\_remaining\_trials}.
+\end{itemize}
+
+The relevant options are:
+
+\begin{verbatim}
+--range-gc
+--gc-one-trials 128
+--gc-trials 1000
+--gc-seconds 60
+--urgent-sleep-ms 20
+\end{verbatim}
+
+\subsection{Step 5: Compare and report}
+
+The harness writes:
+
+\begin{verbatim}
+summary.txt
+summary.json
+logs/f2fs_attrs_before.txt
+logs/f2fs_attrs_after.txt
+logs/helper_gc_range.txt
+logs/gc_urgent.txt
+\end{verbatim}
+
+A successful line in \texttt{summary.txt} looks like:
+
+\begin{verbatim}
+MOVED    sha=true  inode=true  extents=3->3 /data/app/.../base.apk
+\end{verbatim}
+
+That means content and inode stayed stable, but physical extents changed.
+
+\section{Interpreting Common Outcomes}
+
+\subsection{MOVED, hash true, inode true}
+
+This is the desired result.  The file itself did not change, but FIEMAP changed.
+This is consistent with F2FS relocating valid blocks during GC.
+
+\subsection{MOVED, hash false}
+
+This is not a clean GC relocation proof.  The file content changed.  For ODEX
+and VDEX this may indicate ART regenerated the artifact.  Run dexopt before the
+baseline snapshot, or use \texttt{--skip-dexopt} only when you intentionally
+want to observe ART changes.
+
+\subsection{same-map with GC counters increasing}
+
+GC happened, but the target files were not moved.  Common reasons:
+
+\begin{itemize}[nosep]
+\item their sections were fully valid;
+\item the sections were not selected as victims;
+\item donor files landed in hot/warm data while the package artifacts were cold;
+\item the files or sections were pinned;
+\item there was not enough GC pressure;
+\item \texttt{--range-gc} was not used.
+\end{itemize}
+
+\subsection{same-map with no moved-block counter delta}
+
+The GC path probably did not move data blocks.  Check:
+
+\begin{itemize}[nosep]
+\item \texttt{/data} is really F2FS;
+\item root shell has uid 0;
+\item helper binary runs on the device architecture;
+\item \texttt{gc\_urgent} and moved-block sysfs files exist;
+\item the filesystem has enough dirty or prefree segments to make GC useful.
+\end{itemize}
+
+\section{Segment-Level Debug}
+
+Use:
+
+\begin{verbatim}
+--collect-segment-info
+\end{verbatim}
+
+This collects:
+
+\begin{verbatim}
+logs/segment_info_before.txt
+logs/segment_info_after.txt
+logs/f2fs_status_before.txt
+logs/f2fs_status_after.txt
+\end{verbatim}
+
+On kernels with the F2FS proc debug entries enabled, \texttt{segment\_info}
+uses this format:
+
+\begin{verbatim}
+segment_type|valid_blocks
+segment_type(0:HD, 1:WD, 2:CD, 3:HN, 4:WN, 5:CN)
+\end{verbatim}
+
+For a normal 4 KiB block, 2 MiB segment F2FS layout, one segment has 512
+blocks.  If a target's section is full of valid blocks, GC has little reason to
+move it unless a force-migration path is used.  The controlled install workflow
+tries to make the target section partially invalid by deleting co-located donor
+files before GC.
+
+\section{F2FS Extension Classification}
+
+F2FS can classify extensions as cold or hot through:
+
+\begin{verbatim}
+/sys/fs/f2fs/<device>/extension_list
+\end{verbatim}
+
+The harness records this in:
+
+\begin{verbatim}
+logs/f2fs_attrs_before.txt
+logs/f2fs_attrs_after.txt
+\end{verbatim}
+
+If \texttt{apk}, \texttt{odex}, and \texttt{vdex} are cold extensions, donor
+files with those suffixes are more likely to share the package artifact
+allocation class.  If they are not cold extensions, the donor files may not help
+as much.  Changing the extension list is a lab-only intervention because it
+changes the filesystem policy being tested.
+
+\section{Pinning Check}
+
+F2FS supports pinned files.  Pinned files are intended not to be moved by GC
+until enough GC failures cause F2FS to drop the guarantee.  The harness records:
+
+\begin{verbatim}
+gc_pin_file_thresh
+\end{verbatim}
+
+If target package artifacts are pinned, normal GC relocation may be very rare.
+That is a filesystem policy result, not a harness failure.
+
+\section{Safety Notes}
+
+\begin{itemize}
+\item Run this on a lab device or a disposable test image.
+\item Keep enough free space on \texttt{/data}; donor files can be large.
+\item The harness does not intentionally write target package files.
+\item The harness does intentionally create and delete files under
+      \texttt{/data/local/tmp/f2fs\_gc\_lab\_donors}.
+\item Aggressive GC can affect device performance during the run.
+\item If you use \texttt{--uninstall-first}, the package is removed before
+      reinstall.
+\end{itemize}
+
+\section{Minimal Command Set}
+
+Build helper:
+
+\begin{verbatim}
+cd tools/f2fs_fiemap_gc_lab
+export ANDROID_NDK_HOME=/path/to/android-ndk
+make android ANDROID_ARCH=arm64 ANDROID_API=30
+\end{verbatim}
+
+Run controlled install:
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
+  --helper ./f2fs_gc_probe.android \
+  --install-apk /path/to/base.apk \
+  --range-gc \
+  --gc-one-trials 128 \
+  --gc-seconds 60 \
+  --donor-count 64 \
+  --donor-mib 4 \
+  --collect-segment-info
+\end{verbatim}
+
+Inspect:
+
+\begin{verbatim}
+cat f2fs-gc-lab-*/summary.txt
+\end{verbatim}
+
+\section{Expected Reality}
+
+A one-in-fifty result is plausible if the app was already installed and only
+post-install app activity or unrelated random IO was used.  The package files
+must be in victim sections that contain invalid blocks.  The controlled install
+workflow is designed to create that condition.  If even the controlled flow does
+not move \texttt{base.apk}, focus next on segment state, extension
+classification, pinning, and whether the GC range ioctl is actually accepted by
+the device kernel.
+
+\end{document}
