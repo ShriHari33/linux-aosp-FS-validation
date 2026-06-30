@@ -60,6 +60,7 @@ Build targets for a host compile check, Android helper build, and this PDF. \\
 Short command reference. \\
 \end{longtable}
 
+
 \section{Prerequisites}
 
 \begin{itemize}
@@ -67,39 +68,64 @@ Short command reference. \\
 \item Working \texttt{adb}.
 \item \texttt{/data} mounted as F2FS.
 \item Enough free space on \texttt{/data} for donor files.
-\item Android NDK if you want the recommended native helper.
+\item A device-side FIEMAP command if you want exact-file proof without a helper.
 \end{itemize}
 
-The helper is strongly recommended.  Many Android builds do not ship
-\texttt{filefrag}, and there is no standard shell command for
-\texttt{F2FS\_IOC\_GARBAGE\_COLLECT\_RANGE}.  Without the helper, the harness can
-still collect package paths, hashes, stats, and F2FS sysfs counters, but FIEMAP
-comparison may not be possible.
+You do not need to build Android code for the basic workflow.  The no-build path
+uses \texttt{adb}, root shell commands, F2FS sysfs knobs, donor files, and
+\texttt{f2fs\_io fiemap} if the device already has it.  If \texttt{f2fs\_io}
+is unavailable but \texttt{filefrag} exists, the harness falls back to
+\texttt{filefrag}.  If the device has neither, the harness can still show
+package paths, hashes, inodes, and F2FS GC counters, but it cannot prove that a
+specific \texttt{base.apk}, ODEX, or VDEX file changed FIEMAP.
 
-\section{Build the Helper}
+\section{No-Build Probe}
 
-From the kernel tree:
+Run this first:
 
 \begin{verbatim}
 cd tools/f2fs_fiemap_gc_lab
+python3 f2fs_fiemap_gc_lab.py --probe-only
+\end{verbatim}
+
+The probe writes:
+
+\begin{verbatim}
+probe_summary.txt
+device_capabilities.json
+logs/device_tools.txt
+\end{verbatim}
+
+Interpretation:
+
+\begin{itemize}[nosep]
+\item \texttt{FIEMAP source: f2fs\_io}: exact-file FIEMAP comparison will use
+      on-device \texttt{f2fs\_io fiemap}.
+\item \texttt{FIEMAP source: filefrag}: exact-file FIEMAP comparison is possible
+      through fallback \texttt{filefrag}.
+\item \texttt{FIEMAP source: none}: the run can still create GC pressure and read
+      F2FS counters, but per-file FIEMAP movement will be reported as
+      \texttt{map-unk}.
+\item \texttt{sysfs: not found}: the device kernel does not expose the expected
+      F2FS sysfs controls to this root shell.
+\end{itemize}
+
+\section{Optional Native Helper}
+
+The native helper is optional.  Use it only if you later have a way to run a
+small device binary.  It adds direct \texttt{FS\_IOC\_FIEMAP}, ordinary F2FS GC
+ioctl, and F2FS GC range ioctl support.
+
+\begin{verbatim}
 export ANDROID_NDK_HOME=/path/to/android-ndk
 make android ANDROID_ARCH=arm64 ANDROID_API=30
 \end{verbatim}
 
-For a quick local compile check only:
+Then pass:
 
 \begin{verbatim}
-make host
+--helper ./f2fs_gc_probe.android --range-gc --gc-one-trials 128
 \end{verbatim}
-
-The Android build produces:
-
-\begin{verbatim}
-tools/f2fs_fiemap_gc_lab/f2fs_gc_probe.android
-\end{verbatim}
-
-The harness pushes this binary to \texttt{/data/local/tmp/f2fs\_gc\_probe} when
-\texttt{--helper} is supplied.
 
 \section{Recommended Workflow: Controlled APK Install}
 
@@ -132,11 +158,8 @@ For split APKs, repeat \texttt{--install-apk}.  For one APK, provide one
 \begin{verbatim}
 python3 f2fs_fiemap_gc_lab.py \
   --package your.package.name \
-  --helper ./f2fs_gc_probe.android \
   --install-apk /path/to/base.apk \
   --install-apk /path/to/split_config.apk \
-  --range-gc \
-  --gc-one-trials 128 \
   --gc-seconds 60 \
   --donor-count 64 \
   --donor-mib 4 \
@@ -148,10 +171,8 @@ If you want to remove the existing package first:
 \begin{verbatim}
 python3 f2fs_fiemap_gc_lab.py \
   --package your.package.name \
-  --helper ./f2fs_gc_probe.android \
   --install-apk /path/to/base.apk \
-  --uninstall-first \
-  --range-gc
+  --uninstall-first
 \end{verbatim}
 
 \section{Existing Play Store Install Workflow}
@@ -164,9 +185,6 @@ VDEX files.
 \begin{verbatim}
 python3 f2fs_fiemap_gc_lab.py \
   --package your.package.name \
-  --helper ./f2fs_gc_probe.android \
-  --range-gc \
-  --gc-one-trials 128 \
   --gc-seconds 60 \
   --donor-count 64 \
   --donor-mib 4
@@ -177,10 +195,8 @@ If package discovery misses an artifact, add it explicitly:
 \begin{verbatim}
 python3 f2fs_fiemap_gc_lab.py \
   --package your.package.name \
-  --helper ./f2fs_gc_probe.android \
   --extra-path /data/app/.../oat/arm64/base.odex \
-  --extra-path /data/app/.../oat/arm64/base.vdex \
-  --range-gc
+  --extra-path /data/app/.../oat/arm64/base.vdex
 \end{verbatim}
 
 \section{What the Harness Does}
@@ -192,7 +208,7 @@ For every target file, the harness captures:
 \begin{itemize}[nosep]
 \item \texttt{stat} output;
 \item SHA-256;
-\item FIEMAP extents through the helper, or \texttt{filefrag} if available;
+\item FIEMAP extents through the helper, \texttt{f2fs\_io fiemap}, or fallback \texttt{filefrag};
 \item F2FS sysfs counters.
 \end{itemize}
 
@@ -404,25 +420,34 @@ That is a filesystem policy result, not a harness failure.
       reinstall.
 \end{itemize}
 
+
 \section{Minimal Command Set}
 
-Build helper:
+Probe the device first:
 
 \begin{verbatim}
 cd tools/f2fs_fiemap_gc_lab
-export ANDROID_NDK_HOME=/path/to/android-ndk
-make android ANDROID_ARCH=arm64 ANDROID_API=30
+python3 f2fs_fiemap_gc_lab.py --probe-only
+cat f2fs-gc-lab-*/probe_summary.txt
 \end{verbatim}
 
-Run controlled install:
+Run an existing-install no-build test:
 
 \begin{verbatim}
 python3 f2fs_fiemap_gc_lab.py \
   --package your.package.name \
-  --helper ./f2fs_gc_probe.android \
+  --gc-seconds 60 \
+  --donor-count 64 \
+  --donor-mib 4 \
+  --collect-segment-info
+\end{verbatim}
+
+Run a controlled APK install no-build test:
+
+\begin{verbatim}
+python3 f2fs_fiemap_gc_lab.py \
+  --package your.package.name \
   --install-apk /path/to/base.apk \
-  --range-gc \
-  --gc-one-trials 128 \
   --gc-seconds 60 \
   --donor-count 64 \
   --donor-mib 4 \
@@ -442,7 +467,7 @@ post-install app activity or unrelated random IO was used.  The package files
 must be in victim sections that contain invalid blocks.  The controlled install
 workflow is designed to create that condition.  If even the controlled flow does
 not move \texttt{base.apk}, focus next on segment state, extension
-classification, pinning, and whether the GC range ioctl is actually accepted by
-the device kernel.
+classification, pinning, whether a FIEMAP source exists on the device, and
+whether you can later use the optional GC range helper.
 
 \end{document}

@@ -88,6 +88,9 @@ class Lab:
         self.proc_dir = ""
         self.targets: list[str] = []
         self.warnings: list[str] = []
+        self.f2fs_io_cmd = ""
+        self.filefrag_cmd = ""
+        self.capabilities: dict[str, Any] = {}
 
     def adb_base(self) -> list[str]:
         cmd = [self.args.adb]
@@ -171,6 +174,79 @@ class Lab:
         self.helper_installed = out.strip() == "ok"
         if not self.helper_installed:
             raise RuntimeError("helper push succeeded, but device helper is not executable")
+
+    def detect_device_tools(self) -> None:
+        eprint("probing device-side tools")
+        script = r'''
+set +e
+echo "PATH=$PATH"
+for name in filefrag f2fs_io dump.f2fs fsck.f2fs toybox busybox; do
+    p=$(command -v "$name" 2>/dev/null)
+    [ -n "$p" ] && echo "$name=$p"
+done
+if command -v filefrag >/dev/null 2>&1; then
+    echo "filefrag_cmd=$(command -v filefrag)"
+elif toybox 2>/dev/null | tr ' ' '\n' | grep -qx filefrag; then
+    echo "filefrag_cmd=toybox filefrag"
+elif busybox 2>/dev/null | tr ' ,' '\n\n' | grep -qx filefrag; then
+    echo "filefrag_cmd=busybox filefrag"
+fi
+for p in /system/bin/filefrag /vendor/bin/filefrag /product/bin/filefrag /system/xbin/filefrag /data/data/com.termux/files/usr/bin/filefrag; do
+    [ -x "$p" ] && echo "filefrag_candidate=$p"
+done
+'''
+        out = self.root(script, check=False)
+        self.write_text("logs/device_tools.txt", out)
+
+        caps: dict[str, Any] = {
+            "helper_installed": self.helper_installed,
+            "f2fs_io_cmd": "",
+            "filefrag_cmd": "",
+            "commands": {},
+            "filefrag_candidates": [],
+        }
+        for line in out.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "f2fs_io" and not caps["f2fs_io_cmd"]:
+                caps["f2fs_io_cmd"] = value
+                caps["commands"][key] = value
+            elif key == "filefrag_cmd" and not caps["filefrag_cmd"]:
+                caps["filefrag_cmd"] = value
+            elif key == "filefrag_candidate":
+                caps["filefrag_candidates"].append(value)
+                if not caps["filefrag_cmd"]:
+                    caps["filefrag_cmd"] = value
+            else:
+                caps["commands"][key] = value
+
+        self.f2fs_io_cmd = str(caps["f2fs_io_cmd"])
+        self.filefrag_cmd = str(caps["filefrag_cmd"])
+        self.capabilities = caps
+
+        if self.helper_installed:
+            caps["fiemap_source"] = "helper"
+        elif self.f2fs_io_cmd:
+            caps["fiemap_source"] = "f2fs_io"
+        elif self.filefrag_cmd:
+            caps["fiemap_source"] = "filefrag"
+        else:
+            caps["fiemap_source"] = "none"
+            self.append_warning(
+                "no helper, f2fs_io fiemap, or filefrag found; this run can show hashes, "
+                "inodes, and F2FS GC counters, but cannot prove exact-file "
+                "FIEMAP movement"
+            )
+
+        if not self.helper_installed and self.args.range_gc:
+            self.append_warning("--range-gc requires the native helper; ignoring it")
+        if not self.helper_installed and self.args.gc_one_trials:
+            self.append_warning("--gc-one-trials requires the native helper; sysfs gc_urgent will still run")
+
+        self.write_json("device_capabilities.json", caps)
 
     def discover_mounts(self) -> None:
         eprint("discovering /data F2FS mount")
@@ -374,10 +450,24 @@ find /data/dalvik-cache -type f \\( -name "*$pkg*.odex" -o -name "*$pkg*.vdex" \
         self.write_text("targets.txt", "\n".join(self.targets) + "\n")
         return self.targets
 
-    def has_filefrag(self) -> bool:
-        out = self.root("command -v filefrag >/dev/null 2>&1 && echo yes",
-                        check=False)
-        return out.strip() == "yes"
+    def run_f2fs_io_fiemap(self, path: str, size: int) -> tuple[str, str]:
+        if not self.f2fs_io_cmd:
+            return "", ""
+        blocks = max(1, (max(0, size) + 4095) // 4096)
+        exe = q(self.f2fs_io_cmd)
+        quoted_path = q(path)
+        candidates = [
+            f"{exe} fiemap 0 {blocks} {quoted_path}",
+            f"{exe} fiemap {quoted_path}",
+            f"{exe} fiemap 0 0 {quoted_path}",
+        ]
+        logs = []
+        for command in candidates:
+            out = self.root(f"{command} 2>&1", check=False)
+            logs.append(f"$ {command}\n{out}")
+            if looks_like_fiemap_output(out):
+                return out, command
+        return "\n--- candidate output ---\n".join(logs), candidates[0]
 
     def snapshot_file(self, path: str, label: str) -> dict[str, Any]:
         safe = sha1_text(path)[:12] + "_" + re.sub(r"[^A-Za-z0-9_.-]", "_", Path(path).name)
@@ -403,12 +493,31 @@ sha256sum "$p" 2>/dev/null || toybox sha256sum "$p" 2>/dev/null
                 entry["fiemap"] = json.loads(fm)
             except json.JSONDecodeError:
                 entry["fiemap_error"] = fm.strip()
-        elif self.has_filefrag():
-            fm = self.root(f"filefrag -v {q(path)}", check=False)
+        elif self.f2fs_io_cmd:
+            try:
+                size = int(entry.get("stat", {}).get("size", "0"))
+            except ValueError:
+                size = 0
+            fm, command = self.run_f2fs_io_fiemap(path, size)
+            entry["fiemap_raw"] = fm.strip()
+            entry["fiemap_tool"] = "f2fs_io"
+            entry["fiemap_command"] = command
+            parsed = parse_f2fs_io_fiemap(fm, path)
+            if parsed:
+                entry["fiemap"] = parsed
+            else:
+                entry["fiemap_error"] = "could not parse f2fs_io fiemap output"
+        elif self.filefrag_cmd:
+            fm = self.root(f"{self.filefrag_cmd} -v {q(path)}", check=False)
             entry["fiemap_raw"] = fm.strip()
             entry["fiemap_tool"] = "filefrag"
+            parsed = parse_filefrag(fm, path)
+            if parsed:
+                entry["fiemap"] = parsed
+            else:
+                entry["fiemap_error"] = "could not parse filefrag output"
         else:
-            fm = "no helper binary and no filefrag on device"
+            fm = "no helper binary, f2fs_io fiemap, or filefrag on device"
             entry["fiemap_raw"] = fm
             entry["fiemap_error"] = fm
             self.append_warning(f"cannot collect FIEMAP for {path}: {fm}")
@@ -508,7 +617,8 @@ sync
                 "same_sha256": b.get("sha256") == a.get("sha256"),
                 "same_inode": same_inode(b, a),
                 "same_size": b.get("stat", {}).get("size") == a.get("stat", {}).get("size"),
-                "fiemap_changed": fiemap_signature(b) != fiemap_signature(a),
+                "fiemap_available": fiemap_available(b) and fiemap_available(a),
+                "fiemap_changed": fiemap_available(b) and fiemap_available(a) and fiemap_signature(b) != fiemap_signature(a),
                 "before_extent_count": extent_count(b),
                 "after_extent_count": extent_count(a),
             }
@@ -528,6 +638,15 @@ sync
         self.verify_device()
         self.install_helper()
         self.discover_mounts()
+        self.detect_device_tools()
+
+        if self.args.probe_only:
+            self.collect_f2fs_state("probe", segment_info=False)
+            self.write_text("probe_summary.txt", render_probe_summary(self))
+            return
+
+        if not self.args.package:
+            raise RuntimeError("--package is required unless --probe-only is used")
 
         if self.args.install_apk and self.args.stage_donors_before_install:
             self.create_donors("before_install")
@@ -582,14 +701,162 @@ def parse_sha256(text: str) -> str:
     return ""
 
 
+def looks_like_fiemap_output(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    bad_markers = (
+        "usage", "unknown command", "invalid", "not found",
+        "no such file", "permission denied", "operation not permitted",
+        "failed", "fail:", "error",
+    )
+    if any(marker in lower for marker in bad_markers):
+        return False
+    return (
+        "fiemap" in lower or
+        "extent" in lower or
+        bool(re.search(r"(?m)^\s*(?:\[?\d+\]?|extent\s+\d+)\s*[: ]", stripped))
+    )
+
+
+def parse_num(value: str) -> int:
+    value = value.strip().rstrip(",;:")
+    return int(value, 16) if value.lower().startswith("0x") else int(value)
+
+
+def parse_f2fs_io_fiemap(text: str, path: str) -> dict[str, Any]:
+    extents = []
+    useful_lines = []
+    fallback_extent_lines = []
+    extent_count = None
+    block_size = 4096
+
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("$"):
+            continue
+        lower = raw.lower()
+        if any(marker in lower for marker in ("usage", "unknown command", "invalid", "not found", "failed", "error")):
+            continue
+        line_looks_like_extent = bool(re.match(r"^(?:\[?\d+\]?|extent\s+\d+)\s*[: ]", raw))
+        if "extent" in lower or "fiemap" in lower or line_looks_like_extent:
+            useful_lines.append(raw)
+        if "extent" in lower or line_looks_like_extent:
+            fallback_extent_lines.append(raw)
+        m = re.search(r"(?:extent|extents)\D+(\d+)", lower)
+        if m:
+            extent_count = int(m.group(1))
+
+        pairs = {}
+        for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*[=:]\s*(0x[0-9a-fA-F]+|\d+)", raw):
+            pairs[key.lower()] = parse_num(value)
+        logical = first_present(pairs, ("logical", "logical_offset", "offset", "fofs", "log"))
+        physical = first_present(pairs, ("physical", "physical_offset", "phys", "blkaddr", "pblk", "disk"))
+        length = first_present(pairs, ("length", "len", "blocks"))
+        if logical is not None and physical is not None and length is not None:
+            extents.append({
+                "index": len(extents),
+                "logical": logical,
+                "physical": physical,
+                "length": length,
+                "flags": raw,
+                "raw": raw,
+            })
+            continue
+
+        nums = re.findall(r"0x[0-9a-fA-F]+|\d+", raw)
+        if re.match(r"^(?:\[?\d+\]?|extent\s+\d+)\s*[: ]", raw) and len(nums) >= 4:
+            values = [parse_num(x) for x in nums]
+            # Most f2fs_io builds report block-oriented offsets.  The exact
+            # unit is less important than stable before/after comparison, but
+            # convert to byte-like values for consistency with filefrag/helper.
+            extents.append({
+                "index": values[0],
+                "logical": values[1] * block_size,
+                "physical": values[2] * block_size,
+                "length": values[3] * block_size,
+                "flags": raw,
+                "raw": raw,
+            })
+
+    if not extents and fallback_extent_lines:
+        extents = [{"index": i, "raw": line, "flags": line} for i, line in enumerate(fallback_extent_lines)]
+    if not extents:
+        return {}
+    return {
+        "path": path,
+        "tool": "f2fs_io",
+        "block_size": block_size,
+        "extent_count": extent_count if extent_count is not None else len(extents),
+        "extents": extents,
+    }
+
+
+def first_present(mapping: dict[str, int], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def parse_filefrag(text: str, path: str) -> dict[str, Any]:
+    extents = []
+    block_size = 4096
+    extent_count = None
+    for line in text.splitlines():
+        m = re.search(r"File size of .+ is \d+ \((\d+) block", line)
+        if m:
+            # filefrag reports counts in filesystem blocks, normally 4 KiB on F2FS.
+            block_size = 4096
+        m = re.search(r"(?:^|:)\s*(\d+) extent", line)
+        if m:
+            extent_count = int(m.group(1))
+        m = re.match(
+            r"^\s*(\d+):\s+(\d+)\.\.\s*(\d+):\s+"
+            r"(\d+)\.\.\s*(\d+):\s+(\d+):(?:\s+\S+:)?\s*(.*)$",
+            line,
+        )
+        if not m:
+            continue
+        extents.append({
+            "index": int(m.group(1)),
+            "logical_block_start": int(m.group(2)),
+            "logical_block_end": int(m.group(3)),
+            "physical_block_start": int(m.group(4)),
+            "physical_block_end": int(m.group(5)),
+            "length_blocks": int(m.group(6)),
+            "logical": int(m.group(2)) * block_size,
+            "physical": int(m.group(4)) * block_size,
+            "length": int(m.group(6)) * block_size,
+            "flags": m.group(7).strip(),
+            "flags_text": m.group(7).strip(),
+        })
+    if not extents and extent_count is None:
+        return {}
+    if not extents and extent_count != 0:
+        return {}
+    return {
+        "path": path,
+        "tool": "filefrag",
+        "block_size": block_size,
+        "extent_count": extent_count if extent_count is not None else len(extents),
+        "extents": extents,
+    }
+
 def fiemap_signature(entry: dict[str, Any]) -> Any:
     fm = entry.get("fiemap")
     if isinstance(fm, dict) and isinstance(fm.get("extents"), list):
         return [
-            (x.get("logical"), x.get("physical"), x.get("length"), x.get("flags"))
+            (x.get("logical"), x.get("physical"), x.get("length"), x.get("flags"), x.get("raw"))
             for x in fm["extents"]
         ]
     return entry.get("fiemap_raw", "")
+
+
+def fiemap_available(entry: dict[str, Any]) -> bool:
+    fm = entry.get("fiemap")
+    return isinstance(fm, dict) and isinstance(fm.get("extents"), list)
 
 
 def extent_count(entry: dict[str, Any]) -> int | None:
@@ -642,6 +909,33 @@ def counter_delta(before_state: dict[str, Any], after_state: dict[str, Any]) -> 
     return delta
 
 
+def render_probe_summary(lab: Lab) -> str:
+    caps = lab.capabilities
+    lines = [
+        "F2FS FIEMAP GC lab probe",
+        "",
+        f"/data mount: {lab.data_mount.get('device', '?')} {lab.data_mount.get('fstype', '?')} {lab.data_mount.get('options', '')}",
+        f"sysfs: {lab.sysfs_dir or 'not found'}",
+        f"procfs: {lab.proc_dir or 'not found'}",
+        f"FIEMAP source: {caps.get('fiemap_source', 'none')}",
+        f"f2fs_io command: {caps.get('f2fs_io_cmd') or 'not found'}",
+        f"filefrag command: {caps.get('filefrag_cmd') or 'not found'}",
+        f"helper installed: {str(caps.get('helper_installed')).lower()}",
+    ]
+    commands = caps.get("commands", {})
+    if commands:
+        lines.append("")
+        lines.append("Device commands found:")
+        for key in sorted(commands):
+            lines.append(f"  {key}: {commands[key]}")
+    if lab.warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in lab.warnings:
+            lines.append(f"  {warning}")
+    return "\n".join(lines) + "\n"
+
+
 def render_summary(summary: dict[str, Any]) -> str:
     lines = []
     lines.append("F2FS FIEMAP GC lab summary")
@@ -651,7 +945,10 @@ def render_summary(summary: dict[str, Any]) -> str:
         if row.get("missing_after"):
             lines.append(f"  MISSING after: {row['path']}")
             continue
-        verdict = "MOVED" if row["fiemap_changed"] else "same-map"
+        if not row.get("fiemap_available"):
+            verdict = "map-unk"
+        else:
+            verdict = "MOVED" if row["fiemap_changed"] else "same-map"
         lines.append(
             f"  {verdict:8} sha={str(row['same_sha256']).lower():5} "
             f"inode={str(row['same_inode']).lower():5} "
@@ -674,7 +971,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate FIEMAP movement of Android APK/ODEX/VDEX files under F2FS GC."
     )
-    parser.add_argument("--package", required=True,
+    parser.add_argument("--package",
                         help="Android package name, for example com.example.game")
     parser.add_argument("--adb", default="adb", help="adb executable")
     parser.add_argument("--serial", help="adb device serial")
@@ -713,7 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--range-gc", action="store_true",
                         help="use helper gc-range for each target extent")
-    parser.add_argument("--gc-one-trials", type=int, default=32,
+    parser.add_argument("--gc-one-trials", type=int, default=0,
                         help="ordinary F2FS GC ioctl iterations through helper")
     parser.add_argument("--gc-trials", type=int, default=1000,
                         help="gc_remaining_trials value for gc_urgent")
@@ -725,6 +1022,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="sleep after GC before after snapshot")
     parser.add_argument("--collect-segment-info", action="store_true",
                         help="collect full /proc/fs/f2fs/<dev>/segment_info")
+    parser.add_argument("--probe-only", action="store_true",
+                        help="only detect root/F2FS/FIEMAP capabilities; no package required")
     return parser
 
 
